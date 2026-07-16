@@ -9525,10 +9525,7 @@ mod tests {
         assert!(state.restore_check_text.is_none());
         assert!(state.restore_check_fn.is_none());
         assert_eq!(state.restore_status, "loaded_but_invalid");
-        assert_eq!(
-            state.restore_status_detail.as_deref(),
-            Some("missing text")
-        );
+        assert_eq!(state.restore_status_detail.as_deref(), Some("missing text"));
         assert!(state.restore_load_failed);
         assert!(!state.restore_validation_pending);
     }
