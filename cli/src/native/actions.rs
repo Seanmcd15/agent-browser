@@ -1353,11 +1353,6 @@ fn reconcile_restore_check_change(
         }
     } else {
         state.restore_validation_pending = false;
-        if state.restore_status == "loaded_but_invalid" {
-            state.restore_status = "loaded".to_string();
-            state.restore_status_detail = None;
-            state.restore_load_failed = false;
-        }
     }
 }
 
@@ -9504,7 +9499,7 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_config_command_clears_sticky_checks_and_policy() {
+    fn test_restore_config_command_clears_sticky_checks_without_clearing_failure() {
         let mut state = DaemonState::new();
         state.session_name = Some("same-key".to_string());
         state.restore_save = "never".to_string();
@@ -9529,9 +9524,9 @@ mod tests {
         assert!(state.restore_check_url.is_none());
         assert!(state.restore_check_text.is_none());
         assert!(state.restore_check_fn.is_none());
-        assert_eq!(state.restore_status, "loaded");
-        assert!(state.restore_status_detail.is_none());
-        assert!(!state.restore_load_failed);
+        assert_eq!(state.restore_status, "loaded_but_invalid");
+        assert_eq!(state.restore_status_detail.as_deref(), Some("missing text"));
+        assert!(state.restore_load_failed);
         assert!(!state.restore_validation_pending);
     }
 
