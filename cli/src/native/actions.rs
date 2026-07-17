@@ -2503,7 +2503,9 @@ fn mark_explicit_storage_state_loaded(state: &mut DaemonState, path: &str) {
     state.restore_status_detail = None;
     state.restore_loaded_path = Some(path.to_string());
     state.restore_load_failed = false;
-    state.restore_validation_pending = false;
+    state.restore_validation_pending = state.restore_check_url.is_some()
+        || state.restore_check_text.is_some()
+        || state.restore_check_fn.is_some();
     state.restore_save_status = "not_attempted".to_string();
     state.restore_saved_path = None;
 }
@@ -9589,7 +9591,7 @@ mod tests {
     }
 
     #[test]
-    fn test_explicit_state_load_clears_restore_failure_for_auto_save() {
+    fn test_explicit_state_load_without_checks_clears_restore_failure_for_auto_save() {
         let mut state = DaemonState::new();
         state.session_name = Some("restore-key".to_string());
         state.restore_status = "loaded_but_invalid".to_string();
@@ -9612,6 +9614,24 @@ mod tests {
         assert!(!state.restore_validation_pending);
         assert_eq!(state.restore_save_status, "not_attempted");
         assert!(state.restore_saved_path.is_none());
+    }
+
+    #[test]
+    fn test_explicit_state_load_with_checks_requires_revalidation() {
+        let mut state = DaemonState::new();
+        state.session_name = Some("restore-key".to_string());
+        state.restore_check_text = Some("Dashboard".to_string());
+        state.restore_status = "loaded_but_invalid".to_string();
+        state.restore_status_detail = Some("missing text".to_string());
+        state.restore_load_failed = true;
+        state.restore_validation_pending = false;
+
+        mark_explicit_storage_state_loaded(&mut state, "/tmp/my-auth.json");
+
+        assert_eq!(state.restore_status, "loaded");
+        assert!(state.restore_status_detail.is_none());
+        assert!(!state.restore_load_failed);
+        assert!(state.restore_validation_pending);
     }
 
     #[test]
