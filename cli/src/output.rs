@@ -83,6 +83,22 @@ fn print_with_boundaries(content: &str, origin: Option<&str>, opts: &OutputOptio
     }
 }
 
+fn format_read_output(
+    content: &str,
+    origin: Option<&str>,
+    opts: &OutputOptions,
+    body_truncated: bool,
+) -> String {
+    let mut output = format_with_boundaries(content, origin, opts);
+    if body_truncated {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(crate::read::BODY_TRUNCATION_NOTICE);
+    }
+    output
+}
+
 fn boundary_origin(data: &serde_json::Value) -> Option<&str> {
     for key in ["origin", "finalUrl", "url"] {
         if let Some(value) = data.get(key).and_then(|v| v.as_str()) {
@@ -385,7 +401,18 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
                     .get("finalUrl")
                     .and_then(|v| v.as_str())
                     .or_else(|| data.get("url").and_then(|v| v.as_str()));
-                print_with_boundaries(content, origin, opts);
+                let output = format_read_output(
+                    content,
+                    origin,
+                    opts,
+                    data.get("truncated")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                );
+                print!("{}", output);
+                if !output.ends_with('\n') {
+                    println!();
+                }
             }
             return;
         }
@@ -1357,6 +1384,8 @@ text extracted from HTML, and print only the document content by default.
 Use --outline for a compact heading outline of a single page. Use --llms index
 or --llms full for nearest-ancestor llms files; with no URL, --llms and
 --require-md use the active tab URL because they depend on HTTP resources.
+HTTP response bodies are limited to 2 MiB; text output warns if the body was
+truncated, while --json also sets data.truncated to true.
 
 Options:
   --raw                Print the response body without HTML extraction
@@ -3749,8 +3778,8 @@ pub fn print_version() {
 #[cfg(test)]
 mod tests {
     use super::{
-        boundary_origin, format_storage_text, format_vitals_text, format_with_boundaries,
-        OutputOptions,
+        boundary_origin, format_read_output, format_storage_text, format_vitals_text,
+        format_with_boundaries, OutputOptions,
     };
     use serde_json::json;
 
@@ -3900,6 +3929,37 @@ hydration: -  phases: 0  hydratedComponents: 0"
         assert!(rendered.contains("origin=https://example.com"));
         assert!(rendered.contains("\ncontent\n"));
         assert!(rendered.contains("END_AGENT_BROWSER_PAGE_CONTENT"));
+    }
+
+    #[test]
+    fn test_format_read_output_reports_body_truncation_after_boundary() {
+        let opts = OutputOptions {
+            content_boundaries: true,
+            ..OutputOptions::default()
+        };
+
+        let rendered =
+            format_read_output("partial content", Some("https://example.com"), &opts, true);
+        let boundary_end = rendered
+            .find("END_AGENT_BROWSER_PAGE_CONTENT")
+            .expect("boundary should be present");
+        let notice = rendered
+            .find(crate::read::BODY_TRUNCATION_NOTICE)
+            .expect("truncation notice should be present");
+
+        assert!(notice > boundary_end);
+    }
+
+    #[test]
+    fn test_format_read_output_omits_notice_for_complete_body() {
+        let rendered = format_read_output(
+            "complete content",
+            Some("https://example.com"),
+            &OutputOptions::default(),
+            false,
+        );
+
+        assert_eq!(rendered, "complete content");
     }
 
     #[test]

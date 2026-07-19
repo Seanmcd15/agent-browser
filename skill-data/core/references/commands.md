@@ -14,6 +14,7 @@ agent-browser open <url>      # Launch + navigate (aliases: goto, navigate)
 agent-browser read [url]      # Fetch agent-readable text, or read rendered active-tab DOM
                               # Explicit URLs send Accept: text/markdown, then try .md if needed
                               # Walks ancestor paths for llms.txt before HTML fallback
+                              # HTTP bodies over 2 MiB are truncated with an explicit notice
                               # --llms and --require-md without URL use the active tab URL
                               # --filter narrows page content to matching heading sections
                               # Honors --allowed-domains, --content-boundaries, and --max-output
