@@ -3624,7 +3624,14 @@ fn response_text(value: &Value) -> Option<String> {
                 "snapshot", "text", "html", "report", "value", "content", "title", "url", "path",
             ] {
                 if let Some(s) = data.get(key).and_then(|v| v.as_str()) {
-                    return Some(s.to_string());
+                    let mut text = s.to_string();
+                    if key == "content"
+                        && data.get("truncated").and_then(|v| v.as_bool()) == Some(true)
+                    {
+                        text.push_str("\n\n");
+                        text.push_str(crate::read::BODY_TRUNCATION_NOTICE);
+                    }
+                    return Some(text);
                 }
             }
             if let Some(result) = data.get("result") {
@@ -3850,6 +3857,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(text, "# Docs\n\nReadable content.");
+    }
+
+    #[test]
+    fn response_text_reports_truncated_read_content() {
+        let text = response_text(&json!({
+            "success": true,
+            "data": {
+                "url": "https://example.com/docs",
+                "content": "partial content",
+                "truncated": true
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            text,
+            format!(
+                "partial content\n\n{}",
+                crate::read::BODY_TRUNCATION_NOTICE
+            )
+        );
     }
 
     #[test]

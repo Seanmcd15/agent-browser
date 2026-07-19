@@ -9,6 +9,10 @@ use url::Url;
 
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// Appended to human and MCP text output when an HTTP response exceeds
+/// `BODY_LIMIT`; JSON callers can also inspect the `truncated` field.
+pub(crate) const BODY_TRUNCATION_NOTICE: &str =
+    "[truncated: response body exceeded the 2 MiB read limit]";
 const READ_ACCEPT: &str = "text/markdown, text/plain;q=0.9, text/html;q=0.7, */*;q=0.1";
 const USER_AGENT_VALUE: &str = concat!("agent-browser/", env!("CARGO_PKG_VERSION"), " read");
 
