@@ -3873,10 +3873,7 @@ mod tests {
 
         assert_eq!(
             text,
-            format!(
-                "partial content\n\n{}",
-                crate::read::BODY_TRUNCATION_NOTICE
-            )
+            format!("partial content\n\n{}", crate::read::BODY_TRUNCATION_NOTICE)
         );
     }
 
