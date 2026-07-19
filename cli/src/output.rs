@@ -3778,8 +3778,8 @@ pub fn print_version() {
 #[cfg(test)]
 mod tests {
     use super::{
-        boundary_origin, format_storage_text, format_vitals_text, format_with_boundaries,
-        OutputOptions,
+        boundary_origin, format_read_output, format_storage_text, format_vitals_text,
+        format_with_boundaries, OutputOptions,
     };
     use serde_json::json;
 
