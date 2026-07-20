@@ -756,6 +756,10 @@ pub fn find_auto_state_file(session_name: &str) -> Option<String> {
     }
 
     let dir = get_sessions_dir();
+    find_auto_state_file_in_dir(&dir, session_name)
+}
+
+fn find_auto_state_file_in_dir(dir: &std::path::Path, session_name: &str) -> Option<String> {
     if !dir.exists() {
         return None;
     }
@@ -770,10 +774,23 @@ pub fn find_auto_state_file(session_name: &str) -> Option<String> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let is_match = fname.starts_with(&prefix)
-                && (fname.ends_with(".json") || fname.ends_with(".json.enc"));
-            if !is_match {
+            if !fname.starts_with(&prefix) {
                 continue;
+            }
+            let is_current = fname.ends_with(".json") || fname.ends_with(".json.enc");
+            let is_previous =
+                fname.ends_with(".json.previous") || fname.ends_with(".json.enc.previous");
+            if !is_current && !is_previous {
+                continue;
+            }
+            // A crash can leave the last good state rotated to `.previous`
+            // before the validated candidate is promoted. Recover that backup,
+            // but never select it when its promoted state exists.
+            if is_previous {
+                let current_name = fname.trim_end_matches(".previous");
+                if dir.join(current_name).exists() {
+                    continue;
+                }
             }
             let modified = fs::metadata(&path)
                 .ok()
@@ -939,6 +956,37 @@ mod tests {
         assert!(!sessions.join("auth-test.json").exists());
         assert!(!sessions.join("auth-test.json.previous").exists());
         assert!(!sessions.join("auth-test.json.enc.previous").exists());
+    }
+
+    #[test]
+    fn test_find_auto_state_file_recovers_interrupted_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for (session_name, extension) in [("plain", ".json"), ("encrypted", ".json.enc")] {
+            let previous = dir
+                .path()
+                .join(format!("{session_name}-test{extension}.previous"));
+            fs::write(&previous, "{}").unwrap();
+
+            assert_eq!(
+                find_auto_state_file_in_dir(dir.path(), session_name),
+                Some(previous.to_string_lossy().to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_auto_state_file_prefers_promoted_state_over_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("auth-test.json");
+        let previous = dir.path().join("auth-test.json.previous");
+        fs::write(&current, "current").unwrap();
+        fs::write(&previous, "previous").unwrap();
+
+        assert_eq!(
+            find_auto_state_file_in_dir(dir.path(), "auth"),
+            Some(current.to_string_lossy().to_string())
+        );
     }
 
     #[test]
