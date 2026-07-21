@@ -544,7 +544,9 @@ mod tests {
         assert_eq!(socket_dir, crate::connection::get_socket_dir());
         assert!(socket_dir.ends_with(
             std::path::PathBuf::from("namespaces")
-                .join("worktree-one")
+                .join(crate::validation::namespace_storage_component(
+                    "Worktree: One"
+                ))
                 .join("run")
         ));
     }
