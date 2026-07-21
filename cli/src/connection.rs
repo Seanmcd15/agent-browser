@@ -1,4 +1,4 @@
-use crate::validation::sanitize_session_component;
+use crate::validation::namespace_storage_component;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
@@ -127,7 +127,7 @@ pub fn get_socket_dir() -> PathBuf {
     };
 
     if let Ok(namespace) = env::var("AGENT_BROWSER_NAMESPACE") {
-        let namespace = sanitize_session_component(&namespace);
+        let namespace = namespace_storage_component(&namespace);
         if !namespace.is_empty() {
             return base.join("namespaces").join(namespace).join("run");
         }
@@ -365,7 +365,7 @@ fn get_port_path(session: &str) -> PathBuf {
 #[cfg(windows)]
 fn port_identity_for_session(session: &str) -> String {
     if let Ok(namespace) = env::var("AGENT_BROWSER_NAMESPACE") {
-        let namespace = sanitize_session_component(&namespace);
+        let namespace = namespace_storage_component(&namespace);
         if !namespace.is_empty() {
             return format!("{}:{}", namespace, session);
         }
@@ -1195,9 +1195,30 @@ mod tests {
             get_socket_dir(),
             PathBuf::from("/tmp/agent-browser-test-sockets")
                 .join("namespaces")
-                .join("worktree-one")
+                .join(namespace_storage_component("Worktree: One"))
                 .join("run")
         );
+    }
+
+    #[test]
+    fn test_get_socket_dir_keeps_colliding_namespaces_isolated() {
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "XDG_RUNTIME_DIR",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        guard.set(
+            "AGENT_BROWSER_SOCKET_DIR",
+            "/tmp/agent-browser-test-sockets",
+        );
+        guard.remove("XDG_RUNTIME_DIR");
+
+        guard.set("AGENT_BROWSER_NAMESPACE", "Worktree One");
+        let with_space = get_socket_dir();
+        guard.set("AGENT_BROWSER_NAMESPACE", "Worktree-One");
+        let with_hyphen = get_socket_dir();
+
+        assert_ne!(with_space, with_hyphen);
     }
 
     #[test]

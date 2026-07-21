@@ -13,7 +13,7 @@ use super::cdp::types::{
     CreateTargetResult, EvaluateParams,
 };
 use super::cookies::{self, Cookie};
-use crate::validation::{is_valid_session_name, sanitize_session_component, session_name_error};
+use crate::validation::{is_valid_session_name, namespace_storage_component, session_name_error};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -833,7 +833,7 @@ pub fn get_state_dir() -> PathBuf {
     };
 
     if let Ok(namespace) = std::env::var("AGENT_BROWSER_NAMESPACE") {
-        let namespace = sanitize_session_component(&namespace);
+        let namespace = namespace_storage_component(&namespace);
         if !namespace.is_empty() {
             return base.join("namespaces").join(namespace).join("state");
         }
@@ -969,12 +969,24 @@ mod tests {
         let dir = get_state_dir();
         let expected_state_suffix = PathBuf::from(".agent-browser")
             .join("namespaces")
-            .join("worktree-one")
+            .join(namespace_storage_component("Worktree: One"))
             .join("state");
         let expected_sessions_suffix = expected_state_suffix.join("sessions");
 
         assert!(dir.ends_with(expected_state_suffix));
         assert!(get_sessions_dir().ends_with(expected_sessions_suffix));
+    }
+
+    #[test]
+    fn test_get_state_dir_keeps_colliding_namespaces_isolated() {
+        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
+
+        guard.set("AGENT_BROWSER_NAMESPACE", "Worktree One");
+        let with_space = get_state_dir();
+        guard.set("AGENT_BROWSER_NAMESPACE", "Worktree-One");
+        let with_hyphen = get_state_dir();
+
+        assert_ne!(with_space, with_hyphen);
     }
 
     #[test]
