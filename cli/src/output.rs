@@ -2685,7 +2685,7 @@ Examples:
   agent-browser state save ./auth-state.json
   agent-browser state load ./auth-state.json
   agent-browser state list
-  agent-browser state show myapp-default.json
+  agent-browser state show auth-state.json
   agent-browser state rename old-name new-name
   agent-browser state clear --all
   agent-browser state clean --older-than 7
@@ -3482,6 +3482,8 @@ Authentication:
   --restore [name]           Auto-save/restore cookies and localStorage.
                              Without a name, uses --session as the restore key
                              (or AGENT_BROWSER_RESTORE env)
+                             Restore keys are matched exactly; ambiguous legacy
+                             files require a one-time explicit --state load
   --restore-save <policy>    Restore auto-save policy: auto, always, never (default: auto)
   --restore-check-url <glob> Validate restored state against current URL pattern
   --restore-check-text <txt> Validate restored state against visible page text

@@ -361,7 +361,7 @@ pub async fn save_auto_state_transactional(
         )
     })?;
 
-    let base_name = format!("{}-{}", session_name, session_id_str);
+    let base_name = auto_state_base_name(session_name, session_id_str);
     let final_json_path = dir.join(format!("{}.json", base_name));
     let final_path = if std::env::var("AGENT_BROWSER_ENCRYPTION_KEY").is_ok() {
         PathBuf::from(format!("{}.enc", final_json_path.to_string_lossy()))
@@ -750,19 +750,35 @@ fn decrypt_data(data: &[u8], key_str: &str) -> Result<Vec<u8>, String> {
     Ok(plaintext)
 }
 
-pub fn find_auto_state_file(session_name: &str) -> Option<String> {
-    if !is_valid_session_name(session_name) {
-        return None;
-    }
+const AUTO_STATE_PREFIX: &str = "restore.v1";
 
-    let dir = get_sessions_dir();
-    if !dir.exists() {
-        return None;
-    }
-    let prefix = format!("{}-", session_name);
+fn auto_state_key_prefix(session_name: &str) -> String {
+    format!(
+        "{}-{}-{}-",
+        AUTO_STATE_PREFIX,
+        session_name.len(),
+        session_name
+    )
+}
+
+fn auto_state_base_name(session_name: &str, session_id: &str) -> String {
+    format!("{}{}", auto_state_key_prefix(session_name), session_id)
+}
+
+pub(super) fn auto_state_file_matches_key(fname: &str, session_name: &str) -> bool {
+    fname.starts_with(&auto_state_key_prefix(session_name))
+        && (is_current_state_file(fname)
+            || fname.ends_with(".json.previous")
+            || fname.ends_with(".json.enc.previous"))
+}
+
+fn newest_matching_state_file(
+    dir: &std::path::Path,
+    mut matches: impl FnMut(&str) -> bool,
+) -> Option<String> {
     let mut best_path: Option<(String, std::time::SystemTime)> = None;
 
-    if let Ok(entries) = fs::read_dir(&dir) {
+    if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             let fname = path
@@ -770,9 +786,7 @@ pub fn find_auto_state_file(session_name: &str) -> Option<String> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let is_match = fname.starts_with(&prefix)
-                && (fname.ends_with(".json") || fname.ends_with(".json.enc"));
-            if !is_match {
+            if !matches(&fname) {
                 continue;
             }
             let modified = fs::metadata(&path)
@@ -784,7 +798,78 @@ pub fn find_auto_state_file(session_name: &str) -> Option<String> {
             }
         }
     }
-    best_path.map(|(p, _)| p)
+
+    best_path.map(|(path, _)| path)
+}
+
+fn is_current_state_file(fname: &str) -> bool {
+    fname.ends_with(".json") || fname.ends_with(".json.enc")
+}
+
+/// Find state saved with the collision-safe automatic restore filename format.
+///
+/// A restore key's length is encoded in the prefix so keys such as `team` and
+/// `team-prod` cannot claim each other's state files. Multiple daemon sessions
+/// may intentionally share one restore key; the newest exact-key file wins.
+pub fn find_auto_state_file(session_name: &str) -> Option<String> {
+    if !is_valid_session_name(session_name) {
+        return None;
+    }
+
+    let dir = get_sessions_dir();
+    if !dir.exists() {
+        return None;
+    }
+
+    newest_matching_state_file(&dir, |fname| {
+        auto_state_file_matches_key(fname, session_name) && is_current_state_file(fname)
+    })
+}
+
+/// Find automatic restore state, including only legacy names that can be
+/// attributed to this exact restore key and daemon session without ambiguity.
+pub fn find_auto_state_file_for_session(
+    session_name: &str,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    if !is_valid_session_name(session_name) {
+        return Ok(None);
+    }
+
+    if let Some(path) = find_auto_state_file(session_name) {
+        return Ok(Some(path));
+    }
+
+    let dir = get_sessions_dir();
+    if !dir.exists() {
+        return Ok(None);
+    }
+
+    // In the legacy `{restore_key}-{session}.json` format, hyphens make the
+    // boundary unknowable. Refuse those files rather than loading another
+    // restore key's cookies or overwriting the old file with logged-out state.
+    if session_name.contains('-') || session_id.contains('-') {
+        let legacy_prefix = format!("{}-", session_name);
+        let has_possible_legacy_file = newest_matching_state_file(&dir, |fname| {
+            !fname.starts_with(&format!("{}-", AUTO_STATE_PREFIX))
+                && fname.starts_with(&legacy_prefix)
+                && is_current_state_file(fname)
+        })
+        .is_some();
+
+        if has_possible_legacy_file {
+            return Err(format!(
+                "Legacy restore files for key '{}' have ambiguous names. Load the intended file explicitly with --state once to migrate it safely.",
+                session_name
+            ));
+        }
+        return Ok(None);
+    }
+
+    let legacy_base = format!("{}-{}", session_name, session_id);
+    Ok(newest_matching_state_file(&dir, |fname| {
+        fname == format!("{}.json", legacy_base) || fname == format!("{}.json.enc", legacy_base)
+    }))
 }
 
 /// Dispatch a state management command from its JSON payload.
@@ -918,6 +1003,65 @@ mod tests {
         assert!(is_encrypted_state(std::path::Path::new(
             "auth.json.enc.previous"
         )));
+    }
+
+    #[test]
+    fn test_auto_state_lookup_does_not_cross_restore_key_prefixes() {
+        let guard = crate::test_utils::EnvGuard::new(&["HOME", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("HOME", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        let sessions = get_sessions_dir();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join(auto_state_base_name("team-prod", "default") + ".json"),
+            "{}",
+        )
+        .unwrap();
+
+        assert_eq!(find_auto_state_file("team"), None);
+        assert!(find_auto_state_file("team-prod")
+            .unwrap()
+            .ends_with("restore.v1-9-team-prod-default.json"));
+    }
+
+    #[test]
+    fn test_auto_state_lookup_refuses_ambiguous_legacy_names() {
+        let guard = crate::test_utils::EnvGuard::new(&["HOME", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("HOME", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        let sessions = get_sessions_dir();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("team-prod-default.json"), "{}").unwrap();
+
+        assert_eq!(
+            find_auto_state_file_for_session("team", "default").unwrap(),
+            None
+        );
+        assert!(find_auto_state_file_for_session("team-prod", "default")
+            .unwrap_err()
+            .contains("ambiguous"));
+    }
+
+    #[test]
+    fn test_auto_state_lookup_migrates_unambiguous_legacy_name() {
+        let guard = crate::test_utils::EnvGuard::new(&["HOME", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("HOME", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        let sessions = get_sessions_dir();
+        fs::create_dir_all(&sessions).unwrap();
+        let legacy = sessions.join("team-default.json");
+        fs::write(&legacy, "{}").unwrap();
+
+        assert_eq!(
+            find_auto_state_file_for_session("team", "default").unwrap(),
+            Some(legacy.to_string_lossy().to_string())
+        );
     }
 
     #[test]

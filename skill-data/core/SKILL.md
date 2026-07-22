@@ -228,7 +228,7 @@ SESSION="$(agent-browser session id --scope worktree --prefix my-app)"
 agent-browser --session "$SESSION" --restore open https://app.example.com
 ```
 
-`--restore` with no value uses the current `--session` as the persistence key. Agent skills should prefer this over hand-built state file paths. Use `--restore-save auto` by default so a failed restore does not overwrite the previous known-good state.
+`--restore` with no value uses the current `--session` as the persistence key. Agent skills should prefer this over hand-built state file paths. Restore keys are matched exactly so similarly prefixed keys remain isolated. Use `--restore-save auto` by default so a failed restore does not overwrite the previous known-good state. If an older hyphenated restore filename is reported as ambiguous, load the intended file once with `--state` to migrate it safely.
 
 ```bash
 agent-browser --session "$SESSION" --restore --restore-check-text Dashboard open https://app.example.com
