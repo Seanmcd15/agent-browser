@@ -2414,35 +2414,45 @@ async fn try_auto_restore_state(state: &mut DaemonState) {
             return;
         }
     };
-    if let Some(path) = state::find_auto_state_file(&session_name) {
-        if let Some(ref mgr) = state.browser {
-            if let Ok(session_id) = mgr.active_session_id() {
-                match state::load_state(&mgr.client, session_id, &path).await {
-                    Ok(()) => {
-                        state.restore_status = "loaded".to_string();
-                        state.restore_status_detail = None;
-                        state.restore_loaded_path = Some(path.clone());
-                        state.restore_load_failed = false;
-                        state.restore_validation_pending = state.restore_check_url.is_some()
-                            || state.restore_check_text.is_some()
-                            || state.restore_check_fn.is_some();
-                    }
-                    Err(err) => {
-                        state.restore_status = "load_failed".to_string();
-                        state.restore_status_detail = Some(err);
-                        state.restore_loaded_path = Some(path);
-                        state.restore_load_failed = true;
-                        state.restore_validation_pending = false;
+    match state::find_auto_state_file_for_session(&session_name, &state.session_id) {
+        Ok(Some(path)) => {
+            if let Some(ref mgr) = state.browser {
+                if let Ok(session_id) = mgr.active_session_id() {
+                    match state::load_state(&mgr.client, session_id, &path).await {
+                        Ok(()) => {
+                            state.restore_status = "loaded".to_string();
+                            state.restore_status_detail = None;
+                            state.restore_loaded_path = Some(path.clone());
+                            state.restore_load_failed = false;
+                            state.restore_validation_pending = state.restore_check_url.is_some()
+                                || state.restore_check_text.is_some()
+                                || state.restore_check_fn.is_some();
+                        }
+                        Err(err) => {
+                            state.restore_status = "load_failed".to_string();
+                            state.restore_status_detail = Some(err);
+                            state.restore_loaded_path = Some(path);
+                            state.restore_load_failed = true;
+                            state.restore_validation_pending = false;
+                        }
                     }
                 }
             }
         }
-    } else {
-        state.restore_status = "missing".to_string();
-        state.restore_status_detail = None;
-        state.restore_loaded_path = None;
-        state.restore_load_failed = false;
-        state.restore_validation_pending = false;
+        Ok(None) => {
+            state.restore_status = "missing".to_string();
+            state.restore_status_detail = None;
+            state.restore_loaded_path = None;
+            state.restore_load_failed = false;
+            state.restore_validation_pending = false;
+        }
+        Err(err) => {
+            state.restore_status = "load_failed".to_string();
+            state.restore_status_detail = Some(err);
+            state.restore_loaded_path = None;
+            state.restore_load_failed = true;
+            state.restore_validation_pending = false;
+        }
     }
 }
 
@@ -9460,6 +9470,38 @@ mod tests {
         assert!(!should_validate_restore_after_action("launch"));
         assert!(should_validate_restore_after_action("navigate"));
         assert!(should_validate_restore_after_action("click"));
+    }
+
+    #[tokio::test]
+    async fn test_ambiguous_legacy_restore_is_not_loaded_or_overwritten() {
+        let guard = EnvGuard::new(&[
+            "HOME",
+            "AGENT_BROWSER_NAMESPACE",
+            "AGENT_BROWSER_RESTORE_SAVE",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("HOME", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard.remove("AGENT_BROWSER_RESTORE_SAVE");
+
+        let sessions = state::get_sessions_dir();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("team-prod-default.json"), "{}").unwrap();
+
+        let mut state = DaemonState::new();
+        state.session_name = Some("team-prod".to_string());
+        state.session_id = "default".to_string();
+        try_auto_restore_state(&mut state).await;
+
+        assert_eq!(state.restore_status, "load_failed");
+        assert!(state
+            .restore_status_detail
+            .as_deref()
+            .unwrap()
+            .contains("ambiguous"));
+        assert!(state.restore_load_failed);
+        assert_eq!(auto_save_restore_state(&mut state).await.unwrap(), None);
+        assert_eq!(state.restore_save_status, "skipped_restore_failed");
     }
 
     #[test]

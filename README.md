@@ -871,7 +871,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | Option | Description |
 |--------|-------------|
 | `--session <name>` | Use isolated session (or `AGENT_BROWSER_SESSION` env) |
-| `--restore [name]` | Auto-save/restore session state. Bare `--restore` uses `--session` as the key |
+| `--restore [name]` | Auto-save/restore session state with exact-key matching. Bare `--restore` uses `--session` as the key. Ambiguous legacy files require a one-time explicit `--state` load |
 | `--restore-save <policy>` | Restore save policy: `auto`, `always`, or `never` |
 | `--restore-check-url <glob>` | Validate restored state against a URL pattern |
 | `--restore-check-text <text>` | Validate restored state against page text |

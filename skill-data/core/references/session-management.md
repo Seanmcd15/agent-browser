@@ -57,7 +57,7 @@ SESSION="$(agent-browser session id --scope worktree --prefix next-dev-loop)"
 agent-browser --session "$SESSION" --restore open https://app.example.com/dashboard
 ```
 
-State is loaded before navigation and saved on close, daemon shutdown, idle timeout, and compatible relaunch. The default save policy is `--restore-save auto`, which skips auto-save if restore failed or validation failed.
+State is loaded before navigation and saved on close, daemon shutdown, idle timeout, and compatible relaunch. Restore keys are matched exactly so similarly prefixed keys cannot load each other's credentials. The default save policy is `--restore-save auto`, which skips auto-save if restore failed or validation failed. If an older hyphenated restore filename is reported as ambiguous, load the intended file once with `--state` to migrate it safely.
 
 ```bash
 agent-browser --session "$SESSION" --restore --restore-check-url "**/dashboard" open https://app.example.com/dashboard

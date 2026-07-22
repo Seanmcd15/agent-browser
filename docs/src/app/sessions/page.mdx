@@ -152,7 +152,7 @@ agent-browser --session "$SESSION" --restore click "#login"
 agent-browser --session "$SESSION" --restore --restore-check-text Dashboard open twitter.com
 ```
 
-State files are stored in `~/.agent-browser/sessions/` and automatically loaded before navigation. With the default `--restore-save auto` policy, failed restore or failed validation skips auto-save.
+State files are stored in `~/.agent-browser/sessions/` and automatically loaded before navigation. Restore keys are matched exactly so similarly prefixed keys cannot load each other's credentials. With the default `--restore-save auto` policy, failed restore or failed validation skips auto-save. If an older hyphenated restore filename is reported as ambiguous, load the intended file once with `--state` to migrate it safely.
 
 ### Restore key rules
 
@@ -205,7 +205,7 @@ agent-browser state clean --older-than 7
 agent-browser state list
 
 # Show state summary (cookies, origins, domains)
-agent-browser state show my-session-default.json
+agent-browser state show auth-state.json
 
 # Rename a state file
 agent-browser state rename old-name new-name
