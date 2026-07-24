@@ -5757,6 +5757,109 @@ async fn e2e_restore_key_switch_reloads_instead_of_reusing_live_browser() {
     let _ = std::fs::remove_file(format!("{}.previous", path_b));
 }
 
+#[tokio::test]
+#[ignore]
+async fn e2e_restore_key_switch_aborts_when_current_state_cannot_be_saved() {
+    let restore_key_a = format!(
+        "e2e-restore-save-failure-a-{}",
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    let restore_key_b = format!(
+        "e2e-restore-save-failure-b-{}",
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    let env = EnvGuard::new(&[
+        "HOME",
+        "AGENT_BROWSER_SESSION_NAME",
+        "AGENT_BROWSER_RESTORE_SAVE",
+        "AGENT_BROWSER_STATE",
+        "AGENT_BROWSER_ENCRYPTION_KEY",
+    ]);
+    let original_home = std::env::var("HOME").expect("HOME should be configured for e2e tests");
+    env.remove("AGENT_BROWSER_SESSION_NAME");
+    env.remove("AGENT_BROWSER_RESTORE_SAVE");
+    env.remove("AGENT_BROWSER_STATE");
+    env.remove("AGENT_BROWSER_ENCRYPTION_KEY");
+
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({
+            "id": "1",
+            "action": "navigate",
+            "url": "https://example.com",
+            "restoreKey": restore_key_a
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "cookies_set",
+            "name": "unsaved_restore_switch",
+            "value": "must-survive",
+            "domain": ".example.com",
+            "path": "/",
+            "expires": 2000000000
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let blocked_home = tempfile::tempdir().expect("temporary home parent should be created");
+    let home_file = blocked_home.path().join("not-a-directory");
+    std::fs::write(&home_file, "block sessions directory creation")
+        .expect("temporary home blocker should be written");
+    env.set("HOME", home_file.to_str().unwrap());
+
+    let resp = execute_command(
+        &json!({
+            "id": "3",
+            "action": "navigate",
+            "url": "https://example.com",
+            "restoreKey": restore_key_b
+        }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false, "save failure must abort key switch");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Failed to create state directory"),
+        "unexpected save error: {}",
+        resp
+    );
+    assert_eq!(state.session_name.as_deref(), Some(restore_key_a.as_str()));
+    assert!(
+        state.browser.is_some(),
+        "current browser must remain open when its state cannot be saved"
+    );
+
+    env.set("HOME", &original_home);
+    let resp = execute_command(&json!({ "id": "4", "action": "cookies_get" }), &mut state).await;
+    assert_success(&resp);
+    assert!(
+        get_data(&resp)["cookies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cookie| {
+                cookie["name"] == "unsaved_restore_switch" && cookie["value"] == "must-survive"
+            }),
+        "failed key switch must preserve the live session"
+    );
+
+    let resp = execute_command(&json!({ "id": "5", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    cleanup_restore_state_files(&restore_key_a);
+    cleanup_restore_state_files(&restore_key_b);
+}
+
 /// Verify that explicit `state_load` restores cookies into an existing
 /// session (baseline sanity check — this path is known to work).
 #[tokio::test]

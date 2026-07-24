@@ -1437,8 +1437,8 @@ async fn apply_restore_config_after_confirmation(
     let had_browser = has_active_browser_session(state);
 
     if restore_key_changed && had_browser {
-        let _ = auto_save_restore_state(state).await;
-        let _ = close_current_browser(state).await;
+        auto_save_restore_state(state).await?;
+        close_current_browser(state).await?;
     }
 
     apply_restore_config_from_command(cmd, state)?;
