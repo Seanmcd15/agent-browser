@@ -5849,8 +5849,7 @@ async fn e2e_restore_key_switch_aborts_when_current_state_cannot_be_saved() {
             .unwrap()
             .iter()
             .any(|cookie| {
-                cookie["name"] == "unsaved_restore_switch"
-                    && cookie["value"] == "must-survive"
+                cookie["name"] == "unsaved_restore_switch" && cookie["value"] == "must-survive"
             }),
         "failed key switch must preserve the live session"
     );
