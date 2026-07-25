@@ -580,6 +580,11 @@ fn daemon_config_fingerprint(opts: &DaemonOptions) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     opts.debug.hash(&mut hasher);
     opts.action_policy.hash(&mut hasher);
+    if let Some(path) = opts.action_policy {
+        // The daemon loads the policy once at startup. Include its contents so
+        // editing a policy in place restarts the daemon with the new rules.
+        fs::read(path).ok().hash(&mut hasher);
+    }
     opts.confirm_actions.hash(&mut hasher);
     opts.allowed_domains.hash(&mut hasher);
     opts.idle_timeout.hash(&mut hasher);
@@ -1290,6 +1295,22 @@ mod tests {
             daemon_config_fingerprint(&base),
             daemon_config_fingerprint(&domains_changed)
         );
+    }
+
+    #[test]
+    fn test_daemon_config_fingerprint_tracks_action_policy_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("policy.json");
+        fs::write(&policy_path, r#"{"deny":[]}"#).unwrap();
+
+        let mut opts = test_daemon_options(None, false, None);
+        opts.action_policy = policy_path.to_str();
+        let original = daemon_config_fingerprint(&opts);
+
+        fs::write(&policy_path, r#"{"deny":["evaluate"]}"#).unwrap();
+        let updated = daemon_config_fingerprint(&opts);
+
+        assert_ne!(original, updated);
     }
 
     #[test]
