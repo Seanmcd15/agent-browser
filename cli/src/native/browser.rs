@@ -1469,6 +1469,10 @@ impl BrowserManager {
         &self.visited_origins
     }
 
+    pub fn add_visited_origins(&mut self, origins: HashSet<String>) {
+        self.visited_origins.extend(origins);
+    }
+
     pub async fn set_download_behavior(&self, download_path: &str) -> Result<(), String> {
         let session_id = self.active_session_id()?;
         self.client

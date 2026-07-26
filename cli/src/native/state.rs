@@ -460,11 +460,20 @@ pub fn validate_state_file(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn load_state(client: &CdpClient, session_id: &str, path: &str) -> Result<(), String> {
+pub async fn load_state(
+    client: &CdpClient,
+    session_id: &str,
+    path: &str,
+) -> Result<HashSet<String>, String> {
     let json_str = read_state_json(path)?;
 
     let state: StorageState =
         serde_json::from_str(&json_str).map_err(|e| format!("Invalid state file: {}", e))?;
+    let loaded_origins = state
+        .origins
+        .iter()
+        .map(|origin| origin.origin.clone())
+        .collect();
 
     // Load cookies
     if !state.cookies.is_empty() {
@@ -534,7 +543,7 @@ pub async fn load_state(client: &CdpClient, session_id: &str, path: &str) -> Res
         }
     }
 
-    Ok(())
+    Ok(loaded_origins)
 }
 
 fn is_state_file(path: &std::path::Path) -> bool {
