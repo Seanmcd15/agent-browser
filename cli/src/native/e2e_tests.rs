@@ -5587,6 +5587,107 @@ async fn e2e_restore_preserves_cookie_login_after_close_and_reopen() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_restore_preserves_all_loaded_origins_on_resave() {
+    let restore_key = format!(
+        "e2e-multi-origin-restore-{}",
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    let env = EnvGuard::new(&[
+        "AGENT_BROWSER_SESSION_NAME",
+        "AGENT_BROWSER_RESTORE_SAVE",
+        "AGENT_BROWSER_STATE",
+        "AGENT_BROWSER_ENCRYPTION_KEY",
+    ]);
+    env.remove("AGENT_BROWSER_SESSION_NAME");
+    env.remove("AGENT_BROWSER_RESTORE_SAVE");
+    env.remove("AGENT_BROWSER_STATE");
+    env.remove("AGENT_BROWSER_ENCRYPTION_KEY");
+
+    let (origin_a, _server_a) = start_echo_server().await;
+    let (origin_b, _server_b) = start_echo_server().await;
+
+    {
+        let mut state = DaemonState::new();
+        for (id, origin, key, value) in [
+            ("1", &origin_a, "origin-a-key", "origin-a-value"),
+            ("2", &origin_b, "origin-b-key", "origin-b-value"),
+        ] {
+            let resp = execute_command(
+                &json!({
+                    "id": id,
+                    "action": "navigate",
+                    "url": origin,
+                    "restoreKey": restore_key
+                }),
+                &mut state,
+            )
+            .await;
+            assert_success(&resp);
+
+            let resp = execute_command(
+                &json!({
+                    "id": format!("{id}-storage"),
+                    "action": "storage_set",
+                    "type": "local",
+                    "key": key,
+                    "value": value
+                }),
+                &mut state,
+            )
+            .await;
+            assert_success(&resp);
+        }
+
+        let resp = execute_command(&json!({ "id": "3", "action": "close" }), &mut state).await;
+        assert_success(&resp);
+        assert_eq!(get_data(&resp)["saveStatus"], "saved");
+    }
+
+    {
+        let mut state = DaemonState::new();
+        let resp = execute_command(
+            &json!({
+                "id": "4",
+                "action": "launch",
+                "headless": true,
+                "restoreKey": restore_key
+            }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        assert_eq!(get_data(&resp)["lifecycle"]["restoreStatus"], "loaded");
+
+        let resp = execute_command(&json!({ "id": "5", "action": "close" }), &mut state).await;
+        assert_success(&resp);
+        assert_eq!(get_data(&resp)["saveStatus"], "saved");
+    }
+
+    let path = super::state::find_auto_state_file(&restore_key)
+        .expect("restore state should still exist after reopening");
+    let saved = std::fs::read_to_string(&path).expect("restore state should be readable");
+    let state_data: Value =
+        serde_json::from_str(&saved).expect("restore state should be valid JSON");
+    let origins = state_data["origins"]
+        .as_array()
+        .expect("restore state should contain origins");
+    for (origin, key) in [(&origin_a, "origin-a-key"), (&origin_b, "origin-b-key")] {
+        assert!(
+            origins.iter().any(|entry| {
+                entry["origin"] == *origin
+                    && entry["localStorage"]
+                        .as_array()
+                        .is_some_and(|items| items.iter().any(|item| item["name"] == key))
+            }),
+            "re-saving a restored session should preserve localStorage for {origin}: {origins:?}"
+        );
+    }
+
+    cleanup_restore_state_files(&restore_key);
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_restore_validation_failure_does_not_overwrite_state() {
     let restore_key = format!(
         "e2e-restore-validation-{}",

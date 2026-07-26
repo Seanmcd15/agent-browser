@@ -2415,25 +2415,35 @@ async fn try_auto_restore_state(state: &mut DaemonState) {
         }
     };
     if let Some(path) = state::find_auto_state_file(&session_name) {
-        if let Some(ref mgr) = state.browser {
+        let load_result = if let Some(ref mgr) = state.browser {
             if let Ok(session_id) = mgr.active_session_id() {
-                match state::load_state(&mgr.client, session_id, &path).await {
-                    Ok(()) => {
-                        state.restore_status = "loaded".to_string();
-                        state.restore_status_detail = None;
-                        state.restore_loaded_path = Some(path.clone());
-                        state.restore_load_failed = false;
-                        state.restore_validation_pending = state.restore_check_url.is_some()
-                            || state.restore_check_text.is_some()
-                            || state.restore_check_fn.is_some();
+                Some(state::load_state(&mgr.client, session_id, &path).await)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(load_result) = load_result {
+            match load_result {
+                Ok(origins) => {
+                    if let Some(ref mut mgr) = state.browser {
+                        mgr.add_visited_origins(origins);
                     }
-                    Err(err) => {
-                        state.restore_status = "load_failed".to_string();
-                        state.restore_status_detail = Some(err);
-                        state.restore_loaded_path = Some(path);
-                        state.restore_load_failed = true;
-                        state.restore_validation_pending = false;
-                    }
+                    state.restore_status = "loaded".to_string();
+                    state.restore_status_detail = None;
+                    state.restore_loaded_path = Some(path.clone());
+                    state.restore_load_failed = false;
+                    state.restore_validation_pending = state.restore_check_url.is_some()
+                        || state.restore_check_text.is_some()
+                        || state.restore_check_fn.is_some();
+                }
+                Err(err) => {
+                    state.restore_status = "load_failed".to_string();
+                    state.restore_status_detail = Some(err);
+                    state.restore_loaded_path = Some(path);
+                    state.restore_load_failed = true;
+                    state.restore_validation_pending = false;
                 }
             }
         }
@@ -2576,14 +2586,19 @@ pub(crate) async fn auto_save_restore_state(
 /// the returned `Result` and keep their previous behavior.
 async fn load_storage_state(state: &mut DaemonState, path: &Option<String>) -> Result<(), String> {
     if let Some(ref path) = path {
-        let mut loaded = false;
-        if let Some(ref mgr) = state.browser {
+        let loaded_origins = if let Some(ref mgr) = state.browser {
             if let Ok(session_id) = mgr.active_session_id() {
-                state::load_state(&mgr.client, session_id, path).await?;
-                loaded = true;
+                Some(state::load_state(&mgr.client, session_id, path).await?)
+            } else {
+                None
             }
-        }
-        if loaded {
+        } else {
+            None
+        };
+        if let Some(origins) = loaded_origins {
+            if let Some(ref mut mgr) = state.browser {
+                mgr.add_visited_origins(origins);
+            }
             mark_explicit_storage_state_loaded(state, path);
         }
     }
@@ -4493,14 +4508,19 @@ async fn handle_state_save(cmd: &Value, state: &DaemonState) -> Result<Value, St
 }
 
 async fn handle_state_load(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let path = cmd
         .get("path")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'path' parameter")?;
 
-    state::load_state(&mgr.client, &session_id, path).await?;
+    let loaded_origins = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        let session_id = mgr.active_session_id()?.to_string();
+        state::load_state(&mgr.client, &session_id, path).await?
+    };
+    if let Some(ref mut mgr) = state.browser {
+        mgr.add_visited_origins(loaded_origins);
+    }
     mark_explicit_storage_state_loaded(state, path);
     Ok(json!({ "loaded": true, "path": path }))
 }
