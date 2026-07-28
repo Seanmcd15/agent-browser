@@ -2570,6 +2570,20 @@ pub(crate) async fn auto_save_restore_state(
     }
 }
 
+async fn save_restore_state_before_relaunch(state: &mut DaemonState) -> Result<(), String> {
+    let browser_can_save = if let Some(ref mut mgr) = state.browser {
+        !mgr.has_process_exited() && mgr.is_connection_alive().await
+    } else {
+        false
+    };
+    let save_result = auto_save_restore_state(state).await;
+
+    if browser_can_save {
+        save_result?;
+    }
+    Ok(())
+}
+
 /// Load storage state if a path is configured.
 ///
 /// Explicit launch should surface this error. Best-effort callers can ignore
@@ -2768,7 +2782,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 
     if needs_relaunch {
         if had_browser_before_launch {
-            let _ = auto_save_restore_state(state).await;
+            save_restore_state_before_relaunch(state).await?;
             close_current_browser(state).await?;
         }
     } else {
