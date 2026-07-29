@@ -3207,8 +3207,9 @@ async fn handle_read(cmd: &Value, state: &DaemonState) -> Result<Value, String> 
     let origin = content_data
         .get("origin")
         .and_then(|v| v.as_str())
-        .filter(|origin| !origin.is_empty())
-        .unwrap_or(active_url);
+        .filter(|origin| !origin.is_empty());
+    crate::read::check_allowed_active_url_for_options(origin.unwrap_or_default(), &options)?;
+    let origin = origin.unwrap_or(active_url);
     Ok(crate::read::read_json_from_active_html(
         origin,
         html.to_string(),
@@ -9970,6 +9971,10 @@ mod tests {
                 "/session/test-session/source",
                 json!({ "value": "<html><body><h1>Account</h1><p>Signed in.</p></body></html>" }),
             ),
+            (
+                "/session/test-session/url",
+                json!({ "value": "https://example.com/app" }),
+            ),
         ])
         .await;
         let mut state = DaemonState::new();
@@ -9993,7 +9998,47 @@ mod tests {
         let content = resp["data"]["content"].as_str().unwrap();
         assert!(content.contains("# Account"));
         assert!(content.contains("Signed in."));
-        assert_eq!(server.await.unwrap(), 2);
+        assert_eq!(server.await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_read_without_url_rechecks_domain_after_content() {
+        let (port, server) = start_webdriver_response_server(vec![
+            (
+                "/session/test-session/url",
+                json!({ "value": "https://example.com/app" }),
+            ),
+            (
+                "/session/test-session/source",
+                json!({ "value": "<html><body>Private data</body></html>" }),
+            ),
+            (
+                "/session/test-session/url",
+                json!({ "value": "https://evil.example/private" }),
+            ),
+        ])
+        .await;
+        let mut state = DaemonState::new();
+        state.backend_type = BackendType::WebDriver;
+        state.webdriver_backend = Some(WebDriverBackend::new(
+            crate::native::webdriver::client::WebDriverClient::new_with_session(
+                port,
+                "test-session".to_string(),
+            ),
+        ));
+        let cmd = json!({
+            "action": "read",
+            "id": "read-active-tab-redirected",
+            "allowedDomains": ["example.com"]
+        });
+
+        let resp = execute_command(&cmd, &mut state).await;
+
+        assert_eq!(resp["success"], false);
+        let error = resp["error"].as_str().unwrap();
+        assert!(error.contains("evil.example"));
+        assert!(error.contains("allowed domains"));
+        assert_eq!(server.await.unwrap(), 3);
     }
 
     #[tokio::test]
