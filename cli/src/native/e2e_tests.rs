@@ -2505,6 +2505,46 @@ async fn e2e_domain_filter() {
     assert_success(&resp);
 }
 
+#[tokio::test]
+#[ignore]
+async fn e2e_domain_filter_on_implicit_launch() {
+    let mut state = DaemonState::new();
+    {
+        let mut df = state.domain_filter.write().await;
+        *df = Some(super::network::DomainFilter::new("example.com"));
+    }
+
+    // Navigate as the first command so execute_command takes the auto-launch
+    // path used by the normal `agent-browser --allowed-domains ... open ...`
+    // workflow.
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "navigate", "url": "https://example.com" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "2", "action": "evaluate",
+            "script": "fetch('https://blocked.com/data').then(() => 'ok').catch(e => 'blocked:' + e.message)",
+            "await": true,
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let result = get_data(&resp)["result"].as_str().unwrap_or("");
+    assert!(
+        result.starts_with("blocked:"),
+        "Fetch to blocked domain should fail after implicit launch, got: {}",
+        result,
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
 // ---------------------------------------------------------------------------
 // Diff engine
 // ---------------------------------------------------------------------------
