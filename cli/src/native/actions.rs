@@ -2059,6 +2059,51 @@ async fn connect_auto_with_fresh_tab() -> Result<BrowserManager, String> {
     Ok(mgr)
 }
 
+/// Install the network security controls immediately after attaching to a
+/// browser and before any restore or storage-state navigation can run.
+async fn install_network_controls(
+    state: &mut DaemonState,
+    has_proxy_auth: bool,
+) -> Result<(), String> {
+    let filter = state.domain_filter.read().await.clone();
+    if filter.is_none() && !has_proxy_auth {
+        return Ok(());
+    }
+
+    let install_result = async {
+        let mgr = state
+            .browser
+            .as_ref()
+            .ok_or_else(|| "Browser not launched".to_string())?;
+        let session_id = mgr.active_session_id()?;
+
+        if let Some(ref filter) = filter {
+            network::install_domain_filter(
+                &mgr.client,
+                session_id,
+                &filter.allowed_domains,
+                has_proxy_auth,
+            )
+            .await?;
+            network::sanitize_existing_pages(&mgr.client, &mgr.pages_list(), filter).await;
+        } else {
+            network::install_domain_filter_fetch(&mgr.client, session_id, has_proxy_auth).await?;
+        }
+
+        Ok::<(), String>(())
+    }
+    .await;
+
+    if let Err(error) = install_result {
+        // A browser without its requested network controls must not remain
+        // reusable after launch reports an error.
+        let _ = close_current_browser(state).await;
+        return Err(format!("Failed to install network controls: {}", error));
+    }
+
+    Ok(())
+}
+
 async fn auto_launch(
     state: &mut DaemonState,
     plugins: Vec<crate::plugins::PluginConfig>,
@@ -2110,6 +2155,7 @@ async fn auto_launch(
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
+        install_network_controls(state, has_proxy_auth).await?;
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
         try_auto_restore_state(state).await;
         try_load_storage_state(state, &storage_state_path).await;
@@ -2133,6 +2179,7 @@ async fn auto_launch(
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
+        install_network_controls(state, has_proxy_auth).await?;
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
         try_auto_restore_state(state).await;
         try_load_storage_state(state, &storage_state_path).await;
@@ -2180,6 +2227,7 @@ async fn auto_launch(
                     state.start_dialog_handler();
                     state.update_stream_client().await;
                     write_provider_file(&state.session_id, &p);
+                    install_network_controls(state, has_proxy_auth).await?;
                     apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
                     try_auto_restore_state(state).await;
                     try_load_storage_state(state, &storage_state_path).await;
@@ -2214,16 +2262,7 @@ async fn auto_launch(
     state.start_fetch_handler();
     state.start_dialog_handler();
     state.update_stream_client().await;
-
-    // Enable Fetch with handleAuthRequests for proxy authentication
-    if has_proxy_auth {
-        if let Some(ref mgr) = state.browser {
-            if let Ok(session_id) = mgr.active_session_id() {
-                let _ = network::install_domain_filter_fetch(&mgr.client, session_id, true).await;
-            }
-        }
-    }
-
+    install_network_controls(state, has_proxy_auth).await?;
     apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
     try_auto_restore_state(state).await;
     try_load_storage_state(state, &storage_state_path).await;
@@ -2725,6 +2764,31 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         use_real_keychain: false,
     };
 
+    let has_proxy_auth = launch_options.proxy_username.is_some();
+    if has_proxy_auth {
+        let mut creds = state.proxy_credentials.write().await;
+        *creds = Some((
+            launch_options.proxy_username.clone().unwrap_or_default(),
+            launch_options.proxy_password.clone().unwrap_or_default(),
+        ));
+    }
+
+    if let Some(domains) = cmd.get("allowedDomains") {
+        let domains = domains.as_str().map(String::from).or_else(|| {
+            domains.as_array().map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        });
+        if let Some(domains) = domains {
+            let mut df = state.domain_filter.write().await;
+            *df = Some(DomainFilter::new(&domains));
+        }
+    }
+
     state.plugin_init_scripts.clear();
     let local_launch =
         cdp_url.is_none() && cdp_port.is_none() && !auto_connect && provider_name.is_none();
@@ -2772,6 +2836,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             close_current_browser(state).await?;
         }
     } else {
+        install_network_controls(state, has_proxy_auth).await?;
         load_storage_state(state, &storage_state_owned).await?;
         return Ok(json!({ "launched": true, "reused": true, "relaunchedBrowser": false }));
     }
@@ -2795,6 +2860,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
+        install_network_controls(state, has_proxy_auth).await?;
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
         try_auto_restore_state(state).await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
@@ -2809,6 +2875,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
+        install_network_controls(state, has_proxy_auth).await?;
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
         try_auto_restore_state(state).await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
@@ -2823,6 +2890,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
+        install_network_controls(state, has_proxy_auth).await?;
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
         try_auto_restore_state(state).await;
         load_storage_state_or_rollback(state, &storage_state_owned).await?;
@@ -2875,6 +2943,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                         state.start_dialog_handler();
                         state.update_stream_client().await;
                         write_provider_file(&state.session_id, provider);
+                        install_network_controls(state, has_proxy_auth).await?;
                         apply_launch_init_scripts(state, &enable_features, &init_script_paths)
                             .await;
                         try_auto_restore_state(state).await;
@@ -2915,25 +2984,6 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         }
     }
 
-    // Store proxy credentials for Fetch.authRequired handling
-    let has_proxy_auth = launch_options.proxy_username.is_some();
-    if has_proxy_auth {
-        let mut creds = state.proxy_credentials.write().await;
-        *creds = Some((
-            launch_options.proxy_username.clone().unwrap_or_default(),
-            launch_options.proxy_password.clone().unwrap_or_default(),
-        ));
-    }
-
-    if let Some(ref domains) = cmd
-        .get("allowedDomains")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-    {
-        let mut df = state.domain_filter.write().await;
-        *df = Some(DomainFilter::new(domains));
-    }
-
     state.engine = engine.as_deref().unwrap_or("chrome").to_string();
     write_engine_file(&state.session_id, &state.engine);
     write_extensions_file_from_paths(&state.session_id, launch_options.extensions.as_deref());
@@ -2944,40 +2994,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     state.start_fetch_handler();
     state.start_dialog_handler();
     state.update_stream_client().await;
-
-    // Enable Fetch interception (domain filtering and/or proxy auth).
-    // Only call Fetch.enable once to avoid overwriting handleAuthRequests.
-    {
-        let df = state.domain_filter.read().await;
-        let has_domain_filter = df.is_some();
-
-        if has_domain_filter || has_proxy_auth {
-            if let Some(ref mgr) = state.browser {
-                if let Ok(session_id) = mgr.active_session_id() {
-                    if let Some(ref filter) = *df {
-                        let _ = network::install_domain_filter(
-                            &mgr.client,
-                            session_id,
-                            &filter.allowed_domains,
-                            has_proxy_auth,
-                        )
-                        .await;
-                        network::sanitize_existing_pages(&mgr.client, &mgr.pages_list(), filter)
-                            .await;
-                    } else {
-                        // No domain filter, but proxy auth needs Fetch.enable
-                        let _ = network::install_domain_filter_fetch(
-                            &mgr.client,
-                            session_id,
-                            has_proxy_auth,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-    }
-
+    install_network_controls(state, has_proxy_auth).await?;
     apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
     try_auto_restore_state(state).await;
 
