@@ -787,6 +787,13 @@ fn run_dashboard_stop(json_mode: bool) {
     }
 }
 
+/// Make the server-level session the default for CLI subprocesses spawned by MCP tools.
+///
+/// Individual tool calls can still override this with their typed `session` argument.
+fn apply_mcp_session_default(session: &str) {
+    env::set_var("AGENT_BROWSER_SESSION", session);
+}
+
 fn run_close_all(flags: &Flags) {
     // walk_daemons auto-cleans stale .pid / .sock / .stream sidecar files and
     // separates out the standalone dashboard. We only want to send `close` to
@@ -1019,6 +1026,7 @@ fn main() {
     // Handle MCP stdio server mode. This must never share stdout with normal
     // CLI output because stdout is reserved for JSON-RPC protocol messages.
     if clean.first().map(|s| s.as_str()) == Some("mcp") {
+        apply_mcp_session_default(&flags.session);
         if let Err(err) = mcp::run_mcp(&clean[1..]) {
             eprintln!("{} {}", color::error_indicator(), err);
             exit(1);
@@ -1783,6 +1791,24 @@ fn run_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_mcp_server_session_becomes_child_process_default() {
+        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_SESSION"]);
+        guard.set("AGENT_BROWSER_SESSION", "ambient-session");
+        let flags = parse_flags(&[
+            "--session".to_string(),
+            "mcp-session".to_string(),
+            "mcp".to_string(),
+        ]);
+
+        apply_mcp_session_default(&flags.session);
+
+        assert_eq!(
+            std::env::var("AGENT_BROWSER_SESSION").as_deref(),
+            Ok("mcp-session")
+        );
+    }
 
     #[test]
     fn test_parse_proxy_simple() {
