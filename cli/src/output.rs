@@ -3156,6 +3156,8 @@ Common tools include:
 
 Each tool has typed fields such as url, selector, text, key, and session.
 Each tool also accepts extraArgs for advanced CLI flags and exact CLI parity.
+Use --session or AGENT_BROWSER_SESSION to set the server default; a tool's
+typed session field overrides it.
 Tool discovery is paginated and includes read-only/open-world annotations so
 modern MCP clients can load the large typed surface incrementally.
 Use agent_browser_snapshot after navigation to get fresh refs before clicking.
