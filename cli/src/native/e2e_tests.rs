@@ -6046,6 +6046,27 @@ async fn e2e_relaunch_when_enable_changes_installs_react_hook() {
         tree
     );
 
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp).get("reused").and_then(|v| v.as_bool()),
+        Some(true),
+        "omitted enable list should preserve and reuse the active launch: {}",
+        resp
+    );
+    assert_eq!(
+        get_data(&resp)["lifecycle"]["relaunchedBrowser"],
+        false,
+        "omitted enable list must not remove active launch scripts"
+    );
+
+    let resp = execute_command(&json!({ "id": "8", "action": "react_tree" }), &mut state).await;
+    assert_success(&resp);
+
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
 }
 

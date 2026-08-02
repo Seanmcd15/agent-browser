@@ -323,6 +323,10 @@ pub struct DaemonState {
     pub stream_server: Option<Arc<StreamServer>>,
     /// Hash of launch options used for the current browser, for relaunch detection.
     launch_hash: Option<u64>,
+    /// Built-in init-script features active for the current browser launch.
+    launch_enable_features: Vec<String>,
+    /// User init-script paths active for the current browser launch.
+    launch_init_script_paths: Vec<String>,
     /// Browser engine name (e.g. "chrome", "lightpanda") for observability.
     pub engine: String,
     /// Default timeout for wait operations, from AGENT_BROWSER_DEFAULT_TIMEOUT env var.
@@ -398,6 +402,8 @@ impl DaemonState {
             stream_client: None,
             stream_server: None,
             launch_hash: None,
+            launch_enable_features: launch_enable_features_from_env(),
+            launch_init_script_paths: launch_init_script_paths_from_env(),
             engine: env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
             // README documents 25s, intentionally below the CLI's 30s IPC
             // read timeout so the daemon reports a proper timeout error
@@ -1471,6 +1477,8 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
 
     close_active_provider_session(state).await;
     state.launch_hash = None;
+    state.launch_enable_features = launch_enable_features_from_env();
+    state.launch_init_script_paths = launch_init_script_paths_from_env();
     state.screencasting = false;
     state.reset_input_state();
     state.update_stream_client().await;
@@ -2267,11 +2275,25 @@ fn string_array_from_command(cmd: &Value, key: &str) -> Option<Vec<String>> {
     })
 }
 
-async fn apply_launch_init_scripts(
+fn launch_script_options_from_command(
+    cmd: &Value,
     state: &DaemonState,
+) -> (Vec<String>, Vec<String>) {
+    let enable_features = string_array_from_command(cmd, "enable")
+        .unwrap_or_else(|| state.launch_enable_features.clone());
+    let init_script_paths = string_array_from_command(cmd, "initScripts")
+        .unwrap_or_else(|| state.launch_init_script_paths.clone());
+    (enable_features, init_script_paths)
+}
+
+async fn apply_launch_init_scripts(
+    state: &mut DaemonState,
     enable_features: &[String],
     init_script_paths: &[String],
 ) {
+    state.launch_enable_features = enable_features.to_vec();
+    state.launch_init_script_paths = init_script_paths.to_vec();
+
     let Some(mgr) = state.browser.as_ref() else {
         return;
     };
@@ -2635,10 +2657,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let provider_name = cmd.get("provider").and_then(|v| v.as_str());
-    let enable_features =
-        string_array_from_command(cmd, "enable").unwrap_or_else(launch_enable_features_from_env);
-    let init_script_paths = string_array_from_command(cmd, "initScripts")
-        .unwrap_or_else(launch_init_script_paths_from_env);
+    let (enable_features, init_script_paths) = launch_script_options_from_command(cmd, state);
 
     let extensions: Option<Vec<String>> =
         cmd.get("extensions").and_then(|v| v.as_array()).map(|arr| {
@@ -10488,6 +10507,25 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
                 None
             )
         );
+    }
+
+    #[test]
+    fn test_omitted_launch_scripts_preserve_active_configuration() {
+        let mut state = DaemonState::new();
+        state.launch_enable_features = vec!["react-devtools".to_string()];
+        state.launch_init_script_paths = vec!["/tmp/active-init.js".to_string()];
+
+        let (enable_features, init_script_paths) =
+            launch_script_options_from_command(&json!({ "action": "launch" }), &state);
+        assert_eq!(enable_features, state.launch_enable_features);
+        assert_eq!(init_script_paths, state.launch_init_script_paths);
+
+        let (enable_features, init_script_paths) = launch_script_options_from_command(
+            &json!({ "action": "launch", "enable": [], "initScripts": [] }),
+            &state,
+        );
+        assert!(enable_features.is_empty());
+        assert!(init_script_paths.is_empty());
     }
 
     #[test]
