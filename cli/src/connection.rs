@@ -385,15 +385,34 @@ pub fn get_port_for_session(session: &str) -> u16 {
 }
 
 /// Read the actual daemon port from the `.port` file written by the daemon.
-/// Falls back to the hash-derived port if the file does not exist or is
-/// unreadable (e.g. daemon has not started yet).
+///
+/// The hash-derived preferred port is deliberately not a fallback here:
+/// different session names can hash to the same port, so connecting without
+/// this session's registration file can target another session's daemon.
 #[cfg(windows)]
-pub fn resolve_port(session: &str) -> u16 {
+pub fn resolve_port(session: &str) -> Result<u16, String> {
     let port_path = get_port_path(session);
-    fs::read_to_string(&port_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u16>().ok())
-        .unwrap_or_else(|| get_port_for_session(session))
+    let value = fs::read_to_string(&port_path).map_err(|e| {
+        format!(
+            "Failed to read daemon port registration {}: {}",
+            port_path.display(),
+            e
+        )
+    })?;
+    let port = value.trim().parse::<u16>().map_err(|e| {
+        format!(
+            "Invalid daemon port registration {}: {}",
+            port_path.display(),
+            e
+        )
+    })?;
+    if port == 0 {
+        return Err(format!(
+            "Invalid daemon port registration {}: port must be greater than 0",
+            port_path.display()
+        ));
+    }
+    Ok(port)
 }
 
 pub fn daemon_ready(session: &str) -> bool {
@@ -404,7 +423,17 @@ pub fn daemon_ready(session: &str) -> bool {
     }
     #[cfg(windows)]
     {
-        let port = resolve_port(session);
+        match fs::read_to_string(get_pid_path(session))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            Some(pid) if is_pid_alive(pid) => {}
+            _ => return false,
+        }
+        let port = match resolve_port(session) {
+            Ok(port) => port,
+            Err(_) => return false,
+        };
         TcpStream::connect_timeout(
             &format!("127.0.0.1:{}", port).parse().unwrap(),
             Duration::from_millis(50),
@@ -976,7 +1005,10 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
         get_socket_dir().join(format!("{}.sock", session)).display()
     );
     #[cfg(windows)]
-    let endpoint_info = format!("port: 127.0.0.1:{}", resolve_port(session));
+    let endpoint_info = match resolve_port(session) {
+        Ok(port) => format!("port: 127.0.0.1:{}", port),
+        Err(_) => format!("port file: {}", get_port_path(session).display()),
+    };
 
     Err(format!("Daemon failed to start ({})", endpoint_info))
 }
@@ -991,7 +1023,7 @@ fn connect(session: &str) -> Result<Connection, String> {
     }
     #[cfg(windows)]
     {
-        let port = resolve_port(session);
+        let port = resolve_port(session)?;
         TcpStream::connect(format!("127.0.0.1:{}", port))
             .map(Connection::Tcp)
             .map_err(|e| format!("Failed to connect: {}", e))
@@ -1198,6 +1230,56 @@ mod tests {
                 .join("worktree-one")
                 .join("run")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_colliding_windows_sessions_require_own_port_registration() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        let first = "session-109";
+        let second = "session-1600";
+        assert_eq!(get_port_for_session(first), 52067);
+        assert_eq!(get_port_for_session(second), 52067);
+
+        fs::create_dir_all(get_socket_dir()).unwrap();
+        fs::write(get_port_path(first), "52067").unwrap();
+
+        assert_eq!(resolve_port(first).unwrap(), 52067);
+        assert!(
+            resolve_port(second).is_err(),
+            "a colliding session must not fall back to another session's preferred port"
+        );
+        assert!(
+            !daemon_ready(second),
+            "a session without its own registration must not reuse a colliding daemon"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_daemon_ready_requires_live_registered_process() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        let session = "registered-session";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        fs::create_dir_all(get_socket_dir()).unwrap();
+        fs::write(get_port_path(session), port.to_string()).unwrap();
+
+        assert!(
+            !daemon_ready(session),
+            "a stale port registration without a live daemon pid must not be reused"
+        );
+
+        fs::write(get_pid_path(session), std::process::id().to_string()).unwrap();
+        assert!(daemon_ready(session));
     }
 
     #[test]
