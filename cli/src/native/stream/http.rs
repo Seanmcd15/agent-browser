@@ -418,7 +418,7 @@ pub(super) async fn relay_command_to_daemon(
 
     #[cfg(windows)]
     let stream = {
-        let port = resolve_port(session_name);
+        let port = resolve_port(session_name)?;
         tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
             .await
             .map_err(|e| format!("Failed to connect to daemon: {}", e))?
