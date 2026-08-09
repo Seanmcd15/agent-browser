@@ -1,5 +1,5 @@
 use futures_util::StreamExt;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION, USER_AGENT};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -43,7 +43,8 @@ pub struct ReadOptions {
     pub filter: Option<String>,
     /// HTTP request timeout in milliseconds.
     pub timeout_ms: u64,
-    /// Extra HTTP headers. A supplied Accept header disables markdown negotiation fallbacks.
+    /// Extra HTTP headers scoped to the requested URL's origin. A supplied Accept header disables
+    /// markdown negotiation fallbacks.
     pub headers: HashMap<String, String>,
     /// Allowed domain patterns, using the same exact and wildcard semantics as --allowed-domains.
     pub allowed_domains: Vec<String>,
@@ -189,20 +190,9 @@ struct LlmsLink {
 pub async fn run_read(raw_url: &str, options: ReadOptions) -> Result<Value, String> {
     let target = normalize_url(raw_url)?;
     check_allowed_url_for_options(&target, &options)?;
-    let redirect_allowed_domain_sets = allowed_domain_sets_for_options(&options);
-    let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() > 10 {
-            attempt.error("too many redirects")
-        } else if let Err(e) = check_allowed_url_sets(attempt.url(), &redirect_allowed_domain_sets)
-        {
-            attempt.error(e)
-        } else {
-            attempt.follow()
-        }
-    });
     let client = Client::builder()
         .timeout(Duration::from_millis(options.timeout_ms))
-        .redirect(redirect_policy)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
@@ -325,22 +315,58 @@ async fn fetch_read_url(
     target: Url,
     options: &ReadOptions,
 ) -> Result<ReadFetch, String> {
-    check_allowed_url_for_options(&target, options)?;
-    let mut request = client
-        .get(target.clone())
-        .header(USER_AGENT, USER_AGENT_VALUE);
-    let has_accept_header = options
-        .headers
-        .keys()
-        .any(|key| key.eq_ignore_ascii_case("accept"));
-    if !has_accept_header {
-        request = request.header(ACCEPT, READ_ACCEPT);
-    }
-    for (key, value) in &options.headers {
-        request = request.header(key, value);
-    }
+    let header_origin = target.clone();
+    let mut current = target;
+    let mut redirect_count = 0;
+    let response = loop {
+        check_allowed_url_for_options(&current, options)?;
+        let send_origin_headers = same_origin(&current, &header_origin);
+        let has_accept_header = send_origin_headers
+            && options
+                .headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("accept"));
+        let mut request = client
+            .get(current.clone())
+            .header(USER_AGENT, USER_AGENT_VALUE);
+        if !has_accept_header {
+            request = request.header(ACCEPT, READ_ACCEPT);
+        }
+        if send_origin_headers {
+            for (key, value) in &options.headers {
+                request = request.header(key, value);
+            }
+        }
 
-    let response = request.send().await.map_err(format_reqwest_error)?;
+        let response = request.send().await.map_err(format_reqwest_error)?;
+        if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            break response;
+        }
+        let Some(location) = response.headers().get(LOCATION) else {
+            break response;
+        };
+        if redirect_count >= 10 {
+            return Err("too many redirects".to_string());
+        }
+        let location = location
+            .to_str()
+            .map_err(|e| format!("Invalid redirect location: {}", e))?;
+        let next = current
+            .join(location)
+            .map_err(|e| format!("Invalid redirect location: {}", e))?;
+        match next.scheme() {
+            "http" | "https" => {}
+            scheme => {
+                return Err(format!(
+                    "Unsupported redirect URL scheme '{}': use http or https",
+                    scheme
+                ))
+            }
+        }
+        check_allowed_url_for_options(&next, options)?;
+        current = next;
+        redirect_count += 1;
+    };
     let status = response.status().as_u16();
     let final_url = response.url().to_string();
     let content_type = response
@@ -546,21 +572,6 @@ fn check_allowed_url(url: &Url, allowed_domains: &[String]) -> Result<(), String
     ))
 }
 
-fn allowed_domain_sets_for_options(options: &ReadOptions) -> Vec<Vec<String>> {
-    let mut sets = Vec::new();
-    if !options.allowed_domains.is_empty() {
-        sets.push(options.allowed_domains.clone());
-    }
-    sets.extend(
-        options
-            .enforced_allowed_domains
-            .iter()
-            .filter(|domains| !domains.is_empty())
-            .cloned(),
-    );
-    sets
-}
-
 fn check_allowed_url_for_options(url: &Url, options: &ReadOptions) -> Result<(), String> {
     check_allowed_url(url, &options.allowed_domains)?;
     for domains in &options.enforced_allowed_domains {
@@ -569,11 +580,10 @@ fn check_allowed_url_for_options(url: &Url, options: &ReadOptions) -> Result<(),
     Ok(())
 }
 
-fn check_allowed_url_sets(url: &Url, allowed_domain_sets: &[Vec<String>]) -> Result<(), String> {
-    for domains in allowed_domain_sets {
-        check_allowed_url(url, domains)?;
-    }
-    Ok(())
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 pub fn check_allowed_active_url_for_options(
@@ -1433,6 +1443,56 @@ Inline [Authentication](/inline-auth) should not become a TOC item.
 
         assert!(err.contains("example.com"));
         assert!(err.contains("allowed domains"));
+    }
+
+    #[tokio::test]
+    async fn run_read_does_not_forward_custom_headers_across_origins() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let mut buf = [0_u8; 4096];
+            let count = stream.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..count]).to_string();
+            let body = "redirected content";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin_listener.accept().await.unwrap();
+            let mut buf = [0_u8; 4096];
+            let count = stream.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..count]).to_string();
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{}/docs\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                target_addr
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+
+        let mut options = ReadOptions::default();
+        options
+            .headers
+            .insert("X-API-Key".to_string(), "origin-secret".to_string());
+        let result = run_read(&format!("http://{}/start", origin_addr), options)
+            .await
+            .unwrap();
+
+        assert_eq!(result["content"], "redirected content");
+        let origin_request = origin_task.await.unwrap().to_ascii_lowercase();
+        let target_request = target_task.await.unwrap().to_ascii_lowercase();
+        assert!(origin_request.contains("x-api-key: origin-secret"));
+        assert!(!target_request.contains("x-api-key"));
+        assert!(!target_request.contains("origin-secret"));
     }
 
     #[tokio::test]
