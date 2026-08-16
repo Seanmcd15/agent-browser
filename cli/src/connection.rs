@@ -1,8 +1,10 @@
 use crate::validation::sanitize_session_component;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -151,6 +153,43 @@ fn get_version_path(session: &str) -> PathBuf {
 
 fn get_config_path(session: &str) -> PathBuf {
     get_socket_dir().join(format!("{}.config", session))
+}
+
+fn get_startup_lock_path(session: &str) -> PathBuf {
+    get_socket_dir().join(format!("{}.startup.lock", session))
+}
+
+struct DaemonStartupLock {
+    _file: fs::File,
+}
+
+fn acquire_daemon_startup_lock(session: &str) -> Result<DaemonStartupLock, String> {
+    let socket_dir = get_socket_dir();
+    fs::create_dir_all(&socket_dir)
+        .map_err(|e| format!("Failed to create socket directory: {}", e))?;
+
+    let path = get_startup_lock_path(session);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| {
+            format!(
+                "Failed to open daemon startup lock '{}': {}",
+                path.display(),
+                e
+            )
+        })?;
+    FileExt::lock_exclusive(&file).map_err(|e| {
+        format!(
+            "Failed to lock daemon startup for session '{}': {}",
+            session, e
+        )
+    })?;
+
+    Ok(DaemonStartupLock { _file: file })
 }
 
 /// Clean up stale socket and PID files for a session
@@ -778,6 +817,11 @@ fn stop_existing_daemon_for_restart(session: &str) {
 }
 
 pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult, String> {
+    // Socket, PID, version, and config sidecars are shared across CLI
+    // processes. Serialize the complete readiness/restart/spawn sequence so
+    // concurrent commands cannot unlink a daemon that another command just
+    // started and bind a second daemon for the same session.
+    let _startup_lock = acquire_daemon_startup_lock(session)?;
     let mut restarted = false;
 
     // Socket connectivity is the sole liveness check — no PID check — so
@@ -1224,6 +1268,33 @@ mod tests {
 
         assert_eq!(inventory.sessions.len(), 1);
         assert_eq!(inventory.sessions[0].name, "current");
+    }
+
+    #[test]
+    fn test_daemon_startup_lock_serializes_same_session() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        let first = acquire_daemon_startup_lock("concurrent").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let lock = acquire_daemon_startup_lock("concurrent").unwrap();
+            tx.send(lock).unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a second startup for the same session must wait for the first"
+        );
+
+        drop(first);
+        let second = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the waiting startup should proceed after the lock is released");
+        drop(second);
+        waiter.join().unwrap();
     }
 
     fn test_daemon_options<'a>(
