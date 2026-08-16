@@ -171,6 +171,7 @@ fn acquire_daemon_startup_lock(session: &str) -> Result<DaemonStartupLock, Strin
     let path = get_startup_lock_path(session);
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)
