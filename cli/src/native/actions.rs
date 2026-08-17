@@ -3310,7 +3310,7 @@ async fn handle_evaluate(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
 }
 
 async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
-    let save_result = auto_save_restore_state(state).await;
+    let saved_path = auto_save_restore_state(state).await?;
     close_current_browser(state).await?;
 
     // Stop background Fetch handler
@@ -3342,23 +3342,17 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
     }
 
     state.ref_map.clear();
-    match save_result {
-        Ok(Some(path)) => Ok(json!({
+    match saved_path {
+        Some(path) => Ok(json!({
             "closed": true,
             "restoreStatus": state.restore_status,
             "saveStatus": state.restore_save_status,
             "statePath": path
         })),
-        Ok(None) => Ok(json!({
+        None => Ok(json!({
             "closed": true,
             "restoreStatus": state.restore_status,
             "saveStatus": state.restore_save_status
-        })),
-        Err(err) => Ok(json!({
-            "closed": true,
-            "restoreStatus": state.restore_status,
-            "saveStatus": state.restore_save_status,
-            "saveError": err
         })),
     }
 }
