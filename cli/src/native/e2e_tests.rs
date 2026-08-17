@@ -5662,8 +5662,7 @@ async fn e2e_close_aborts_when_restore_state_cannot_be_saved() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|cookie| cookie["name"] == "unsaved_close"
-                && cookie["value"] == "must-survive"),
+            .any(|cookie| cookie["name"] == "unsaved_close" && cookie["value"] == "must-survive"),
         "failed close must preserve the live session"
     );
 
