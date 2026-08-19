@@ -1368,7 +1368,7 @@ Options:
 
 Global Options:
   --json               Output metadata and content as JSON
-  --headers <json>     Additional HTTP headers, such as Authorization
+  --headers <json>     Additional HTTP headers; Host overrides are rejected with domain filters
   --allowed-domains <list>  Restrict read fetches and redirects to allowed domains
   --content-boundaries Wrap read output in boundary markers
   --max-output <chars> Truncate read output to N chars

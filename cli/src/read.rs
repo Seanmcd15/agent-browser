@@ -1,5 +1,5 @@
 use futures_util::StreamExt;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HOST, USER_AGENT};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -44,6 +44,7 @@ pub struct ReadOptions {
     /// HTTP request timeout in milliseconds.
     pub timeout_ms: u64,
     /// Extra HTTP headers. A supplied Accept header disables markdown negotiation fallbacks.
+    /// Host overrides are rejected while any domain allowlist is active.
     pub headers: HashMap<String, String>,
     /// Allowed domain patterns, using the same exact and wildcard semantics as --allowed-domains.
     pub allowed_domains: Vec<String>,
@@ -189,6 +190,7 @@ struct LlmsLink {
 pub async fn run_read(raw_url: &str, options: ReadOptions) -> Result<Value, String> {
     let target = normalize_url(raw_url)?;
     check_allowed_url_for_options(&target, &options)?;
+    check_headers_for_domain_filter(&options)?;
     let redirect_allowed_domain_sets = allowed_domain_sets_for_options(&options);
     let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() > 10 {
@@ -517,6 +519,25 @@ fn should_try_md(options: &ReadOptions) -> bool {
         .headers
         .keys()
         .any(|key| key.eq_ignore_ascii_case("accept"))
+}
+
+fn check_headers_for_domain_filter(options: &ReadOptions) -> Result<(), String> {
+    let domain_filter_enabled = !options.allowed_domains.is_empty()
+        || options
+            .enforced_allowed_domains
+            .iter()
+            .any(|domains| !domains.is_empty());
+    if domain_filter_enabled
+        && options
+            .headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case(HOST.as_str()))
+    {
+        return Err(
+            "Host header cannot be overridden while a domain allowlist is active".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn check_allowed_url(url: &Url, allowed_domains: &[String]) -> Result<(), String> {
@@ -1409,6 +1430,56 @@ Inline [Authentication](/inline-auth) should not become a TOC item.
 
         assert!(err.contains("not-example.com"));
         assert!(err.contains("allowed domains"));
+    }
+
+    #[tokio::test]
+    async fn run_read_rejects_host_override_with_enforced_domain_filter() {
+        let mut options = ReadOptions {
+            enforced_allowed_domains: vec![vec!["example.com".to_string()]],
+            ..ReadOptions::default()
+        };
+        options
+            .headers
+            .insert("hOsT".to_string(), "internal.example".to_string());
+
+        let err = run_read("https://example.com/docs", options)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            "Host header cannot be overridden while a domain allowlist is active"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_read_preserves_host_override_without_domain_filter() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{}", addr);
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 2048];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            assert!(request.contains("host: virtual.example"));
+            let body = "# Virtual host\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/markdown\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        let mut options = ReadOptions::default();
+        options
+            .headers
+            .insert("Host".to_string(), "virtual.example".to_string());
+
+        let data = run_read(&base, options).await.unwrap();
+        assert_eq!(data["content"], "# Virtual host\n");
     }
 
     #[tokio::test]
