@@ -181,7 +181,7 @@ agent-browser --allowed-domains "example.com,*.example.com,github.com" open http
 export AGENT_BROWSER_ALLOWED_DOMAINS="example.com,*.example.com"
 ```
 
-Supports exact match (`github.com`) and wildcard prefix (`*.example.com`, which also matches the bare domain `example.com`). Both page navigations and sub-resource requests (scripts, images, fetch, XHR, etc.) to non-allowed domains are blocked, preventing data exfiltration. WebSocket and EventSource connections are also blocked via constructor-level patching. Non-http(s) sub-resources (data URIs, blobs) are still allowed. When a request is blocked, the command returns an error.
+Supports exact match (`github.com`) and wildcard prefix (`*.example.com`, which also matches the bare domain `example.com`). Both page navigations and sub-resource requests (scripts, images, fetch, XHR, etc.) to non-allowed domains are blocked, preventing data exfiltration. WebSocket and EventSource connections are also blocked via constructor-level patching. Non-http(s) sub-resources (data URIs, blobs) are still allowed. URL-based `read` requests also reject custom `Host` headers while an allowlist is active, preventing virtual-host routing from bypassing the URL hostname check. When a request is blocked, the command returns an error.
 
 > **Note:** The WebSocket/EventSource blocking is best-effort -- it works by overriding the browser constructors via an init script. If the `eval` action category is allowed, page scripts could theoretically restore the original constructors. For maximum protection, deny the `eval` category via `--action-policy` when using `--allowed-domains`.
 
