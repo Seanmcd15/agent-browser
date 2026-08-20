@@ -582,6 +582,11 @@ fn daemon_config_fingerprint(opts: &DaemonOptions) -> String {
     opts.action_policy.hash(&mut hasher);
     opts.confirm_actions.hash(&mut hasher);
     opts.allowed_domains.hash(&mut hasher);
+    // State and auth encryption run inside the daemon. Restart it when the
+    // inherited key changes so saves never use stale encryption settings.
+    env::var("AGENT_BROWSER_ENCRYPTION_KEY")
+        .ok()
+        .hash(&mut hasher);
     opts.idle_timeout.hash(&mut hasher);
     opts.default_timeout.hash(&mut hasher);
     opts.no_auto_dialog.hash(&mut hasher);
@@ -1272,24 +1277,34 @@ mod tests {
 
     #[test]
     fn test_daemon_config_fingerprint_tracks_daemon_owned_options() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_ENCRYPTION_KEY"]);
+        guard.remove("AGENT_BROWSER_ENCRYPTION_KEY");
         let domains = vec!["example.com".to_string()];
         let base = test_daemon_options(None, false, None);
         let idle_changed = test_daemon_options(Some("1000"), false, None);
         let dialog_changed = test_daemon_options(None, true, None);
         let domains_changed = test_daemon_options(None, false, Some(&domains));
+        let without_encryption_key = daemon_config_fingerprint(&base);
 
         assert_ne!(
-            daemon_config_fingerprint(&base),
+            without_encryption_key,
             daemon_config_fingerprint(&idle_changed)
         );
         assert_ne!(
-            daemon_config_fingerprint(&base),
+            without_encryption_key,
             daemon_config_fingerprint(&dialog_changed)
         );
         assert_ne!(
-            daemon_config_fingerprint(&base),
+            without_encryption_key,
             daemon_config_fingerprint(&domains_changed)
         );
+
+        guard.set("AGENT_BROWSER_ENCRYPTION_KEY", "first-key");
+        let first_encryption_key = daemon_config_fingerprint(&base);
+        assert_ne!(without_encryption_key, first_encryption_key);
+
+        guard.set("AGENT_BROWSER_ENCRYPTION_KEY", "second-key");
+        assert_ne!(first_encryption_key, daemon_config_fingerprint(&base));
     }
 
     #[test]
