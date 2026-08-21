@@ -659,6 +659,45 @@ pub fn state_clear(path: Option<&str>) -> Result<Value, String> {
     Ok(json!({ "deleted": count }))
 }
 
+/// Clear automatic restore state for one exact restore-key/daemon-session pair.
+///
+/// Both values are needed because legacy automatic state filenames use
+/// `{restore-key}-{daemon-session}`. Matching only the restore-key prefix would
+/// also delete keys such as `team-prod` when clearing `team`.
+pub fn state_clear_session(session_name: &str, session_id: &str) -> Result<Value, String> {
+    if !is_valid_session_name(session_name) {
+        return Err(session_name_error(session_name));
+    }
+    if !is_valid_session_name(session_id) {
+        return Err(session_name_error(session_id));
+    }
+
+    let dir = get_sessions_dir();
+    if !dir.exists() {
+        return Ok(json!({ "deleted": 0, "files": [] }));
+    }
+
+    let base_name = format!("{}-{}", session_name, session_id);
+    let mut deleted = Vec::new();
+    for suffix in [".json", ".json.enc", ".json.previous", ".json.enc.previous"] {
+        let filename = format!("{}{}", base_name, suffix);
+        let path = dir.join(&filename);
+        match fs::remove_file(&path) {
+            Ok(()) => deleted.push(filename),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "Failed to delete state file {}: {}",
+                    path.display(),
+                    err
+                ));
+            }
+        }
+    }
+
+    Ok(json!({ "deleted": deleted.len(), "files": deleted }))
+}
+
 pub fn state_clean(max_age_days: u64) -> Result<Value, String> {
     let dir = get_sessions_dir();
     if !dir.exists() {
@@ -801,7 +840,20 @@ pub fn dispatch_state_command(cmd: &Value) -> Option<Result<Value, String>> {
         ),
         "state_clear" => {
             let path = cmd.get("path").and_then(|v| v.as_str());
-            Some(state_clear(path))
+            if path.is_some() {
+                return Some(state_clear(path));
+            }
+
+            if cmd.get("all").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return Some(state_clear(None));
+            }
+
+            let Some(session_name) = cmd.get("sessionName").and_then(|v| v.as_str()) else {
+                return Some(Ok(json!({ "deleted": 0, "files": [] })));
+            };
+            let session_id =
+                std::env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string());
+            Some(state_clear_session(session_name, &session_id))
         }
         "state_clean" => {
             let days = cmd.get("days").and_then(|v| v.as_u64()).unwrap_or(30);
@@ -939,6 +991,82 @@ mod tests {
         assert!(!sessions.join("auth-test.json").exists());
         assert!(!sessions.join("auth-test.json.previous").exists());
         assert!(!sessions.join("auth-test.json.enc.previous").exists());
+    }
+
+    #[test]
+    fn test_scoped_state_clear_only_removes_exact_session_state() {
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "HOME",
+            "AGENT_BROWSER_NAMESPACE",
+            "AGENT_BROWSER_SESSION",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("HOME", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard.set("AGENT_BROWSER_SESSION", "default");
+
+        let sessions = get_sessions_dir();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("team-default.json"), "{}").unwrap();
+        fs::write(sessions.join("team-default.json.previous"), "{}").unwrap();
+        fs::write(sessions.join("team-prod-default.json"), "{}").unwrap();
+        fs::write(sessions.join("team-other.json"), "{}").unwrap();
+
+        let result = dispatch_state_command(&json!({
+            "action": "state_clear",
+            "sessionName": "team"
+        }))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(result["deleted"], 2);
+        assert!(!sessions.join("team-default.json").exists());
+        assert!(!sessions.join("team-default.json.previous").exists());
+        assert!(sessions.join("team-prod-default.json").exists());
+        assert!(sessions.join("team-other.json").exists());
+    }
+
+    #[test]
+    fn test_state_clear_without_scope_does_not_delete_everything() {
+        let guard = crate::test_utils::EnvGuard::new(&["HOME", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("HOME", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        let sessions = get_sessions_dir();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("keep-default.json"), "{}").unwrap();
+
+        let result = dispatch_state_command(&json!({ "action": "state_clear" }))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result["deleted"], 0);
+        assert!(sessions.join("keep-default.json").exists());
+    }
+
+    #[test]
+    fn test_state_clear_all_still_removes_every_state() {
+        let guard = crate::test_utils::EnvGuard::new(&["HOME", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("HOME", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        let sessions = get_sessions_dir();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("one-default.json"), "{}").unwrap();
+        fs::write(sessions.join("two-default.json"), "{}").unwrap();
+
+        let result = dispatch_state_command(&json!({
+            "action": "state_clear",
+            "all": true
+        }))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(result["deleted"], 2);
+        assert!(!sessions.join("one-default.json").exists());
+        assert!(!sessions.join("two-default.json").exists());
     }
 
     #[test]
