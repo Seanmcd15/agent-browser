@@ -152,6 +152,23 @@ pub async fn run_daemon(session: &str) {
     }
 }
 
+/// Save configured restore state before an idle shutdown may destroy the live
+/// browser. A failed save is retried after another idle interval rather than
+/// silently discarding the only current copy of cookies and storage.
+async fn can_shutdown_after_idle(state: &mut DaemonState) -> bool {
+    match auto_save_restore_state(state).await {
+        Ok(_) => true,
+        Err(err) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Idle shutdown postponed because restore state could not be saved: {}",
+                err
+            );
+            false
+        }
+    }
+}
+
 #[cfg(unix)]
 async fn run_socket_server(
     socket_path: &PathBuf,
@@ -228,7 +245,11 @@ async fn run_socket_server(
                 }
             }, if idle_timeout_ms.is_some() => {
                 let mut s = state.lock().await;
-                let _ = auto_save_restore_state(&mut s).await;
+                if !can_shutdown_after_idle(&mut s).await {
+                    idle_sleep_pin = idle_timeout_ms
+                        .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+                    continue;
+                }
                 let _ = close_current_browser(&mut s).await;
                 break;
             }
@@ -326,7 +347,11 @@ async fn run_socket_server(
                 }
             }, if idle_timeout_ms.is_some() => {
                 let mut s = state.lock().await;
-                let _ = auto_save_restore_state(&mut s).await;
+                if !can_shutdown_after_idle(&mut s).await {
+                    idle_sleep_pin = idle_timeout_ms
+                        .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+                    continue;
+                }
                 let _ = close_current_browser(&mut s).await;
                 let _ = fs::remove_file(&port_path);
                 break;
@@ -599,6 +624,16 @@ mod tests {
             &direct
         ));
         assert!(close_completed_response("confirm", &confirmed));
+    }
+
+    #[tokio::test]
+    async fn test_idle_shutdown_is_postponed_when_restore_save_fails() {
+        let mut state = DaemonState::new();
+        state.session_name = Some("saved-session".to_string());
+        state.restore_save = "invalid".to_string();
+
+        assert!(!can_shutdown_after_idle(&mut state).await);
+        assert_eq!(state.restore_save_status, "invalid_policy");
     }
 
     /// Guard against re-introducing `waitpid(-1)` in daemon code.
