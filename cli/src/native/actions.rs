@@ -260,6 +260,7 @@ pub struct DaemonState {
     pub appium: Option<AppiumManager>,
     pub safari_driver: Option<safari::SafariDriverProcess>,
     pub webdriver_backend: Option<super::webdriver::backend::WebDriverBackend>,
+    webdriver_provider: Option<String>,
     pub backend_type: BackendType,
     pub ref_map: RefMap,
     pub domain_filter: Arc<RwLock<Option<DomainFilter>>>,
@@ -345,6 +346,7 @@ impl DaemonState {
             appium: None,
             safari_driver: None,
             webdriver_backend: None,
+            webdriver_provider: None,
             backend_type: BackendType::Cdp,
             ref_map: RefMap::new(),
             domain_filter: Arc::new(RwLock::new(
@@ -1426,7 +1428,17 @@ fn command_changes_restore_key(cmd: &Value, state: &DaemonState) -> bool {
 }
 
 fn has_active_browser_session(state: &DaemonState) -> bool {
-    state.browser.is_some() || state.active_provider_session.is_some()
+    state.browser.is_some()
+        || state.active_provider_session.is_some()
+        || state.webdriver_backend.is_some()
+}
+
+fn has_compatible_webdriver_session(state: &DaemonState, provider: &str) -> bool {
+    state.webdriver_backend.is_some()
+        && state
+            .webdriver_provider
+            .as_deref()
+            .is_some_and(|active| active.eq_ignore_ascii_case(provider))
 }
 
 async fn apply_restore_config_after_confirmation(
@@ -1470,12 +1482,28 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
     };
 
     close_active_provider_session(state).await;
+    let webdriver_close_error = if let Some(mut backend) = state.webdriver_backend.take() {
+        backend.close().await.err()
+    } else {
+        None
+    };
+    if let Some(mut appium) = state.appium.take() {
+        let _ = appium.close().await;
+    }
+    if let Some(mut driver) = state.safari_driver.take() {
+        driver.kill();
+    }
+    state.webdriver_provider = None;
+    state.backend_type = BackendType::Cdp;
     state.launch_hash = None;
     state.screencasting = false;
     state.reset_input_state();
     state.update_stream_client().await;
 
     if let Some(err) = close_error {
+        return Err(err);
+    }
+    if let Some(err) = webdriver_close_error {
         return Err(err);
     }
     Ok(())
@@ -1526,6 +1554,17 @@ fn skip_launch_action(action: &str) -> bool {
             | "stream_status"
             | "session_info"
     )
+}
+
+async fn needs_implicit_browser_launch(state: &mut DaemonState) -> bool {
+    if let Some(ref mut mgr) = state.browser {
+        return mgr.has_process_exited() || !mgr.is_connection_alive().await;
+    }
+
+    // Safari and iOS sessions use WebDriver rather than CDP. Treating the
+    // missing BrowserManager as a missing browser would launch local Chrome
+    // and route the command away from the active WebDriver session.
+    state.webdriver_backend.is_none()
 }
 
 fn should_validate_restore_after_action(action: &str) -> bool {
@@ -1640,10 +1679,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         // actions are gated when recovery relaunches would invoke plugins.
         if restore_key_change_needs_launch {
             true
-        } else if let Some(ref mut mgr) = state.browser {
-            mgr.has_process_exited() || !mgr.is_connection_alive().await
         } else {
-            true
+            needs_implicit_browser_launch(state).await
         }
     } else {
         false
@@ -2635,6 +2672,14 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let provider_name = cmd.get("provider").and_then(|v| v.as_str());
+    if provider_name.is_some_and(|provider| has_compatible_webdriver_session(state, provider)) {
+        return Ok(json!({
+            "launched": true,
+            "reused": true,
+            "relaunchedBrowser": false,
+            "provider": provider_name
+        }));
+    }
     let enable_features =
         string_array_from_command(cmd, "enable").unwrap_or_else(launch_enable_features_from_env);
     let init_script_paths = string_array_from_command(cmd, "initScripts")
@@ -2763,8 +2808,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         true
     };
 
-    let had_browser_before_launch =
-        state.browser.is_some() || state.active_provider_session.is_some();
+    let had_browser_before_launch = has_active_browser_session(state);
 
     if needs_relaunch {
         if had_browser_before_launch {
@@ -3017,6 +3061,7 @@ async fn launch_ios(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
     }
 
     state.appium = Some(appium);
+    state.webdriver_provider = Some("ios".to_string());
     state.backend_type = BackendType::WebDriver;
     state.engine = "safari".to_string();
     write_engine_file(&state.session_id, &state.engine);
@@ -3065,6 +3110,7 @@ async fn launch_safari(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 
     state.safari_driver = Some(driver);
     state.webdriver_backend = Some(WebDriverBackend::new(client));
+    state.webdriver_provider = Some("safari".to_string());
     state.backend_type = BackendType::WebDriver;
     state.engine = "safari".to_string();
     write_engine_file(&state.session_id, &state.engine);
@@ -3321,21 +3367,6 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
         let mut map = state.origin_headers.write().await;
         map.clear();
     }
-
-    // Close WebDriver sessions
-    if let Some(ref mut wb) = state.webdriver_backend {
-        let _ = wb.close().await;
-    }
-    state.webdriver_backend = None;
-    if let Some(ref mut appium) = state.appium {
-        let _ = appium.close().await;
-    }
-    state.appium = None;
-    if let Some(ref mut driver) = state.safari_driver {
-        driver.kill();
-    }
-    state.safari_driver = None;
-    state.backend_type = BackendType::Cdp;
 
     if let Some(server) = state.inspect_server.take() {
         server.shutdown();
@@ -9894,6 +9925,61 @@ mod tests {
             .unwrap()
             .contains("Browser not launched"));
         assert!(state.browser.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_active_webdriver_session_does_not_implicitly_launch_chrome() {
+        let mut state = DaemonState::new();
+        state.backend_type = BackendType::WebDriver;
+        state.webdriver_backend = Some(WebDriverBackend::new(
+            crate::native::webdriver::client::WebDriverClient::new_with_session(
+                4444,
+                "test-session".to_string(),
+            ),
+        ));
+
+        assert!(!needs_implicit_browser_launch(&mut state).await);
+        assert!(state.browser.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_launch_reuses_compatible_webdriver_session() {
+        let mut state = DaemonState::new();
+        state.backend_type = BackendType::WebDriver;
+        state.webdriver_provider = Some("ios".to_string());
+        state.webdriver_backend = Some(WebDriverBackend::new(
+            crate::native::webdriver::client::WebDriverClient::new_with_session(
+                4444,
+                "test-session".to_string(),
+            ),
+        ));
+
+        let result = handle_launch(&json!({ "provider": "ios" }), &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(result["reused"], true);
+        assert_eq!(result["provider"], "ios");
+        assert!(state.webdriver_backend.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_close_current_browser_cleans_up_webdriver_session() {
+        let mut state = DaemonState::new();
+        state.backend_type = BackendType::WebDriver;
+        state.webdriver_provider = Some("safari".to_string());
+        state.webdriver_backend = Some(WebDriverBackend::new(
+            crate::native::webdriver::client::WebDriverClient::new_with_session(
+                4444,
+                "test-session".to_string(),
+            ),
+        ));
+
+        close_current_browser(&mut state).await.unwrap();
+
+        assert!(state.webdriver_backend.is_none());
+        assert!(state.webdriver_provider.is_none());
+        assert!(matches!(state.backend_type, BackendType::Cdp));
     }
 
     #[tokio::test]
