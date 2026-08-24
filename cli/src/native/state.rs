@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
     AttachToTargetParams, AttachToTargetResult, CloseTargetParams, CreateTargetParams,
-    CreateTargetResult, EvaluateParams,
+    CreateTargetResult, EvaluateParams, EvaluateResult,
 };
 use super::cookies::{self, Cookie};
 use crate::validation::{is_valid_session_name, sanitize_session_component, session_name_error};
@@ -460,6 +460,40 @@ pub fn validate_state_file(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+async fn restore_storage_entry(
+    client: &CdpClient,
+    session_id: &str,
+    storage_type: &str,
+    origin: &str,
+    expression: String,
+) -> Result<(), String> {
+    let result: EvaluateResult = client
+        .send_command_typed(
+            "Runtime.evaluate",
+            &EvaluateParams {
+                expression,
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        )
+        .await
+        .map_err(|e| format!("Failed to restore {storage_type} for {origin}: {e}"))?;
+
+    if let Some(details) = result.exception_details {
+        let message = details
+            .exception
+            .as_ref()
+            .and_then(|exception| exception.description.as_deref())
+            .unwrap_or(&details.text);
+        return Err(format!(
+            "Failed to restore {storage_type} for {origin}: {message}"
+        ));
+    }
+
+    Ok(())
+}
+
 pub async fn load_state(client: &CdpClient, session_id: &str, path: &str) -> Result<(), String> {
     let json_str = read_state_json(path)?;
 
@@ -501,17 +535,7 @@ pub async fn load_state(client: &CdpClient, session_id: &str, path: &str) -> Res
                 serde_json::to_string(&entry.name).unwrap_or_default(),
                 serde_json::to_string(&entry.value).unwrap_or_default(),
             );
-            let _ = client
-                .send_command_typed::<_, super::cdp::types::EvaluateResult>(
-                    "Runtime.evaluate",
-                    &EvaluateParams {
-                        expression: js,
-                        return_by_value: Some(true),
-                        await_promise: Some(false),
-                    },
-                    Some(session_id),
-                )
-                .await;
+            restore_storage_entry(client, session_id, "localStorage", &origin.origin, js).await?;
         }
 
         for entry in &origin.session_storage {
@@ -520,17 +544,7 @@ pub async fn load_state(client: &CdpClient, session_id: &str, path: &str) -> Res
                 serde_json::to_string(&entry.name).unwrap_or_default(),
                 serde_json::to_string(&entry.value).unwrap_or_default(),
             );
-            let _ = client
-                .send_command_typed::<_, super::cdp::types::EvaluateResult>(
-                    "Runtime.evaluate",
-                    &EvaluateParams {
-                        expression: js,
-                        return_by_value: Some(true),
-                        await_promise: Some(false),
-                    },
-                    Some(session_id),
-                )
-                .await;
+            restore_storage_entry(client, session_id, "sessionStorage", &origin.origin, js).await?;
         }
     }
 
@@ -849,6 +863,8 @@ pub fn get_sessions_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
 
     #[test]
     fn test_storage_state_serialization() {
@@ -893,6 +909,84 @@ mod tests {
         let parsed: StorageState = serde_json::from_str(&json).unwrap();
         assert!(parsed.cookies.is_empty());
         assert!(parsed.origins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_state_rejects_storage_evaluation_exceptions() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            let navigate = ws.next().await.unwrap().unwrap();
+            let navigate: Value = serde_json::from_str(navigate.to_text().unwrap()).unwrap();
+            assert_eq!(navigate["method"], "Page.navigate");
+            ws.send(Message::Text(
+                json!({
+                    "id": navigate["id"],
+                    "result": {}
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+
+            let evaluate = ws.next().await.unwrap().unwrap();
+            let evaluate: Value = serde_json::from_str(evaluate.to_text().unwrap()).unwrap();
+            assert_eq!(evaluate["method"], "Runtime.evaluate");
+            ws.send(Message::Text(
+                json!({
+                    "id": evaluate["id"],
+                    "result": {
+                        "result": {
+                            "type": "object",
+                            "description": "QuotaExceededError"
+                        },
+                        "exceptionDetails": {
+                            "text": "Uncaught",
+                            "exception": {
+                                "type": "object",
+                                "description": "QuotaExceededError"
+                            },
+                            "lineNumber": 0,
+                            "columnNumber": 0
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(
+            &path,
+            serde_json::to_string(&StorageState {
+                cookies: vec![],
+                origins: vec![OriginStorage {
+                    origin: "https://example.com".to_string(),
+                    local_storage: vec![StorageEntry {
+                        name: "token".to_string(),
+                        value: "secret".to_string(),
+                    }],
+                    session_storage: vec![],
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let client = CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
+        let error = load_state(&client, "session-1", path.to_str().unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("Failed to restore localStorage"));
+        assert!(error.contains("QuotaExceededError"));
+        server.await.unwrap();
     }
 
     #[test]
