@@ -2508,6 +2508,20 @@ fn mark_explicit_storage_state_loaded(state: &mut DaemonState, path: &str) {
     state.restore_saved_path = None;
 }
 
+fn mark_explicit_storage_state_load_failed(state: &mut DaemonState, path: &str, error: &str) {
+    if state.session_name.is_none() && state.restore_status == "not_configured" {
+        return;
+    }
+
+    state.restore_status = "load_failed".to_string();
+    state.restore_status_detail = Some(error.to_string());
+    state.restore_loaded_path = Some(path.to_string());
+    state.restore_load_failed = true;
+    state.restore_validation_pending = false;
+    state.restore_save_status = "not_attempted".to_string();
+    state.restore_saved_path = None;
+}
+
 pub(crate) async fn auto_save_restore_state(
     state: &mut DaemonState,
 ) -> Result<Option<String>, String> {
@@ -2576,15 +2590,23 @@ pub(crate) async fn auto_save_restore_state(
 /// the returned `Result` and keep their previous behavior.
 async fn load_storage_state(state: &mut DaemonState, path: &Option<String>) -> Result<(), String> {
     if let Some(ref path) = path {
-        let mut loaded = false;
-        if let Some(ref mgr) = state.browser {
+        let load_result = if let Some(ref mgr) = state.browser {
             if let Ok(session_id) = mgr.active_session_id() {
-                state::load_state(&mgr.client, session_id, path).await?;
-                loaded = true;
+                Some(state::load_state(&mgr.client, session_id, path).await)
+            } else {
+                None
             }
-        }
-        if loaded {
-            mark_explicit_storage_state_loaded(state, path);
+        } else {
+            None
+        };
+        if let Some(result) = load_result {
+            match result {
+                Ok(()) => mark_explicit_storage_state_loaded(state, path),
+                Err(err) => {
+                    mark_explicit_storage_state_load_failed(state, path, &err);
+                    return Err(err);
+                }
+            }
         }
     }
 
@@ -4500,9 +4522,16 @@ async fn handle_state_load(cmd: &Value, state: &mut DaemonState) -> Result<Value
         .and_then(|v| v.as_str())
         .ok_or("Missing 'path' parameter")?;
 
-    state::load_state(&mgr.client, &session_id, path).await?;
-    mark_explicit_storage_state_loaded(state, path);
-    Ok(json!({ "loaded": true, "path": path }))
+    match state::load_state(&mgr.client, &session_id, path).await {
+        Ok(()) => {
+            mark_explicit_storage_state_loaded(state, path);
+            Ok(json!({ "loaded": true, "path": path }))
+        }
+        Err(err) => {
+            mark_explicit_storage_state_load_failed(state, path, &err);
+            Err(err)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9624,6 +9653,38 @@ mod tests {
         assert!(state.restore_loaded_path.is_none());
         assert!(!state.restore_load_failed);
         assert_eq!(state.restore_save_status, "not_attempted");
+    }
+
+    #[test]
+    fn test_explicit_state_load_failure_blocks_auto_save() {
+        let mut state = DaemonState::new();
+        state.session_name = Some("restore-key".to_string());
+        state.restore_status = "loaded".to_string();
+        state.restore_loaded_path = Some("/tmp/known-good.json".to_string());
+        state.restore_load_failed = false;
+        state.restore_validation_pending = true;
+        state.restore_save_status = "saved".to_string();
+        state.restore_saved_path = Some("/tmp/known-good.json".to_string());
+
+        mark_explicit_storage_state_load_failed(
+            &mut state,
+            "/tmp/partial.json",
+            "Failed to restore localStorage",
+        );
+
+        assert_eq!(state.restore_status, "load_failed");
+        assert_eq!(
+            state.restore_status_detail.as_deref(),
+            Some("Failed to restore localStorage")
+        );
+        assert_eq!(
+            state.restore_loaded_path.as_deref(),
+            Some("/tmp/partial.json")
+        );
+        assert!(state.restore_load_failed);
+        assert!(!state.restore_validation_pending);
+        assert_eq!(state.restore_save_status, "not_attempted");
+        assert!(state.restore_saved_path.is_none());
     }
 
     #[test]
