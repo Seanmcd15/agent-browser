@@ -104,21 +104,19 @@ pub async fn connect_provider_with_plugins_and_options(
 /// Close a provider session (call on CDP connect failure).
 pub async fn close_provider_session(session: &ProviderSession) {
     let plugins = crate::plugins::plugins_from_env();
-    close_provider_session_with_plugins(session, &plugins).await;
+    let _ = close_provider_session_with_plugins(session, &plugins).await;
 }
 
 /// Close a provider session with the plugin registry that created it.
 pub async fn close_provider_session_with_plugins(
     session: &ProviderSession,
     plugins: &[crate::plugins::PluginConfig],
-) {
+) -> Result<(), String> {
     if let Some(plugin_name) = session.provider.strip_prefix("plugin:") {
-        if let Ok(cleanup) = serde_json::from_str::<Value>(&session.session_id) {
-            let _ =
-                crate::plugins::close_browser_provider_with_plugins(plugin_name, plugins, cleanup)
-                    .await;
-        }
-        return;
+        let cleanup = serde_json::from_str::<Value>(&session.session_id)
+            .map_err(|e| format!("Invalid plugin provider cleanup metadata: {}", e))?;
+        crate::plugins::close_browser_provider_with_plugins(plugin_name, plugins, cleanup).await?;
+        return Ok(());
     }
 
     let client = reqwest::Client::new();
@@ -176,6 +174,7 @@ pub async fn close_provider_session_with_plugins(
         }
         _ => {}
     }
+    Ok(())
 }
 
 pub async fn connect_plugin_provider_with_plugins(
@@ -983,7 +982,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             ..crate::plugins::PluginConfig::default()
         }];
 
-        rt.block_on(close_provider_session_with_plugins(&session, &plugins));
+        rt.block_on(close_provider_session_with_plugins(&session, &plugins))
+            .unwrap();
 
         let request = std::fs::read_to_string(marker_path).unwrap();
         assert!(request.contains(r#""type":"browser.close""#));

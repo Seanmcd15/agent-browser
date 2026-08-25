@@ -1438,7 +1438,7 @@ async fn apply_restore_config_after_confirmation(
 
     if restore_key_changed && had_browser {
         let _ = auto_save_restore_state(state).await;
-        let _ = close_current_browser(state).await;
+        close_current_browser(state).await?;
     }
 
     apply_restore_config_from_command(cmd, state)?;
@@ -1456,10 +1456,13 @@ fn remember_active_provider_session(
     });
 }
 
-async fn close_active_provider_session(state: &mut DaemonState) {
-    if let Some(active) = state.active_provider_session.take() {
-        providers::close_provider_session_with_plugins(&active.session, &active.plugins).await;
-    }
+async fn close_active_provider_session(state: &mut DaemonState) -> Result<(), String> {
+    let Some(active) = state.active_provider_session.as_ref() else {
+        return Ok(());
+    };
+    providers::close_provider_session_with_plugins(&active.session, &active.plugins).await?;
+    state.active_provider_session = None;
+    Ok(())
 }
 
 pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(), String> {
@@ -1469,16 +1472,21 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
         None
     };
 
-    close_active_provider_session(state).await;
+    let provider_close_error = close_active_provider_session(state).await.err();
     state.launch_hash = None;
     state.screencasting = false;
     state.reset_input_state();
     state.update_stream_client().await;
 
-    if let Some(err) = close_error {
-        return Err(err);
+    match (close_error, provider_close_error) {
+        (Some(browser), Some(provider)) => Err(format!(
+            "{}; provider session cleanup failed: {}",
+            browser, provider
+        )),
+        (Some(browser), None) => Err(browser),
+        (None, Some(provider)) => Err(format!("Provider session cleanup failed: {}", provider)),
+        (None, None) => Ok(()),
     }
-    Ok(())
 }
 
 fn provider_plugin_launch_options_from_command(cmd: &Value) -> Value {
@@ -1733,7 +1741,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                 || state.active_provider_session.is_some();
             if state.browser.is_some() || state.active_provider_session.is_some() {
                 let _ = auto_save_restore_state(state).await;
-                let _ = close_current_browser(state).await;
+                if let Err(err) = close_current_browser(state).await {
+                    return error_response(&id, &err);
+                }
             }
             if let Err(e) = auto_launch(state, plugins_from_command_or_env(cmd)).await {
                 return error_response(&id, &format!("Auto-launch failed: {}", e));
@@ -2187,7 +2197,7 @@ async fn auto_launch(
                 }
                 Err(e) => {
                     if let Some(ref ps) = conn.session {
-                        providers::close_provider_session_with_plugins(ps, &plugins).await;
+                        let _ = providers::close_provider_session_with_plugins(ps, &plugins).await;
                     }
                     return Err(format!("Provider '{}' connection failed: {}", p, e));
                 }
@@ -2905,8 +2915,11 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                     }
                     Err(e) => {
                         if let Some(ref ps) = conn.session {
-                            providers::close_provider_session_with_plugins(ps, &command_plugins)
-                                .await;
+                            let _ = providers::close_provider_session_with_plugins(
+                                ps,
+                                &command_plugins,
+                            )
+                            .await;
                         }
                         return Err(e);
                     }
@@ -8900,6 +8913,14 @@ async fn handle_confirm(_cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     let result = Box::pin(execute_command(&pending.cmd, state)).await;
     state.confirmed_policy_actions = previous_confirmed;
 
+    if result.get("success").and_then(|value| value.as_bool()) == Some(false) {
+        return Err(result
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Confirmed action failed")
+            .to_string());
+    }
+
     Ok(json!({ "confirmed": true, "action": pending.action, "result": result }))
 }
 
@@ -10131,6 +10152,74 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         let request = fs::read_to_string(request_path).unwrap();
         assert!(request.contains(r#""type":"browser.close""#));
         assert!(request.contains(r#""sessionId":"s1""#));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_close_retains_provider_session_when_cleanup_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_path = dir.path().join("failing-provider-plugin");
+        fs::write(
+            &plugin_path,
+            r#"#!/bin/sh
+printf '%s' '{"protocol":"agent-browser.plugin.v1","success":false,"error":"cleanup failed"}'
+"#,
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&plugin_path, perms).unwrap();
+
+        let mut state = DaemonState::new();
+        state.active_provider_session = Some(ActiveProviderSession {
+            session: providers::ProviderSession {
+                provider: "plugin:cloud-browser".to_string(),
+                session_id: r#"{"sessionId":"s1"}"#.to_string(),
+            },
+            plugins: vec![crate::plugins::PluginConfig {
+                name: "cloud-browser".to_string(),
+                command: plugin_path.to_string_lossy().to_string(),
+                capabilities: vec![crate::plugins::CAPABILITY_BROWSER_PROVIDER.to_string()],
+                ..crate::plugins::PluginConfig::default()
+            }],
+        });
+
+        let err = handle_close(&mut state).await.unwrap_err();
+
+        assert!(err.contains("cleanup failed") || err.contains("success=false"));
+        assert!(
+            state.active_provider_session.is_some(),
+            "failed cleanup must remain retryable"
+        );
+
+        state.pending_confirmation = Some(PendingConfirmation {
+            action: "close".to_string(),
+            cmd: json!({ "id": "confirmed-close", "action": "close" }),
+            approved_actions: Vec::new(),
+        });
+        let confirm_err = handle_confirm(&json!({ "action": "confirm" }), &mut state)
+            .await
+            .unwrap_err();
+        assert!(confirm_err.contains("success=false"));
+        assert!(
+            state.active_provider_session.is_some(),
+            "confirmed cleanup failure must remain retryable"
+        );
+
+        fs::write(
+            &plugin_path,
+            r#"#!/bin/sh
+printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
+"#,
+        )
+        .unwrap();
+        handle_close(&mut state).await.unwrap();
+        assert!(
+            state.active_provider_session.is_none(),
+            "successful retry must clear provider cleanup metadata"
+        );
     }
 
     #[tokio::test]
