@@ -148,6 +148,12 @@ fn format_stream_status_text(action: Option<&str>, data: &serde_json::Value) -> 
     }
 }
 
+fn react_tree_text<'a>(action: Option<&str>, data: &'a serde_json::Value) -> Option<&'a str> {
+    (action == Some("react_tree"))
+        .then(|| data.get("tree").and_then(|v| v.as_str()))
+        .flatten()
+}
+
 fn confirmation_data(data: &serde_json::Value) -> Option<&serde_json::Value> {
     if data
         .get("confirmation_required")
@@ -406,6 +412,10 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
         // Rich command reports (React renders/suspense and older daemon responses)
         if let Some(report) = data.get("report").and_then(|v| v.as_str()) {
             println!("{}", report);
+            return;
+        }
+        if let Some(tree) = react_tree_text(action, data) {
+            print_with_boundaries(tree, None, opts);
             return;
         }
         // Diff responses -- route by action to avoid fragile shape probing
@@ -3750,7 +3760,7 @@ pub fn print_version() {
 mod tests {
     use super::{
         boundary_origin, format_storage_text, format_vitals_text, format_with_boundaries,
-        OutputOptions,
+        react_tree_text, OutputOptions,
     };
     use serde_json::json;
 
@@ -3779,6 +3789,19 @@ mod tests {
         let rendered = super::format_stream_status_text(Some("stream_status"), &data).unwrap();
 
         assert_eq!(rendered, "Streaming disabled");
+    }
+
+    #[test]
+    fn test_react_tree_text_returns_formatted_tree_for_react_action() {
+        let data = json!({
+            "tree": "# React component tree\n0 1 0 App"
+        });
+
+        assert_eq!(
+            react_tree_text(Some("react_tree"), &data),
+            Some("# React component tree\n0 1 0 App")
+        );
+        assert_eq!(react_tree_text(Some("other"), &data), None);
     }
 
     #[test]
