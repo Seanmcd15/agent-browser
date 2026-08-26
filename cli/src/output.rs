@@ -148,10 +148,7 @@ fn format_stream_status_text(action: Option<&str>, data: &serde_json::Value) -> 
     }
 }
 
-fn react_tree_text<'a>(
-    action: Option<&str>,
-    data: &'a serde_json::Value,
-) -> Option<&'a str> {
+fn react_tree_text<'a>(action: Option<&str>, data: &'a serde_json::Value) -> Option<&'a str> {
     (action == Some("react_tree"))
         .then(|| data.get("tree").and_then(|v| v.as_str()))
         .flatten()
