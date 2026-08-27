@@ -87,6 +87,55 @@ test("runs agent-browser through ctx.getSandbox", async () => {
   assert.equal(commands[0], "agent-browser --session eve-sandbox-id-1 open https://example.com --json");
 });
 
+test("redacts Eve environment values from successful command results", async () => {
+  const commands = [];
+  const ctx = {
+    async getSandbox() {
+      return {
+        id: "sandbox-1",
+        async run({ command }) {
+          commands.push(command);
+          return { exitCode: 0, stdout: '{"ok":true}', stderr: "" };
+        },
+      };
+    },
+  };
+
+  const result = await runAgentBrowser(ctx, ["snapshot"], {
+    env: { API_TOKEN: "top-secret-value" },
+  });
+
+  assert.match(commands[0], /API_TOKEN=top-secret-value/);
+  assert.doesNotMatch(result.command, /top-secret-value/);
+  assert.match(result.command, /API_TOKEN=/);
+});
+
+test("redacts Eve environment values from command errors", async () => {
+  const ctx = {
+    async getSandbox() {
+      return {
+        id: "sandbox-1",
+        async run() {
+          return { exitCode: 2, stdout: "", stderr: "command failed" };
+        },
+      };
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      runAgentBrowser(ctx, ["snapshot"], {
+        env: { API_TOKEN: "top-secret-value" },
+      }),
+    (error) => {
+      assert.doesNotMatch(error.message, /top-secret-value/);
+      assert.doesNotMatch(error.command, /top-secret-value/);
+      assert.match(error.command, /API_TOKEN=/);
+      return true;
+    },
+  );
+});
+
 test("uses a short generated session for long Eve sandbox ids", async () => {
   const commands = [];
   const ctx = {
