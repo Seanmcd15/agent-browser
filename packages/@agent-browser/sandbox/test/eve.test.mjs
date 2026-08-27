@@ -107,7 +107,7 @@ test("redacts Eve environment values from successful command results", async () 
 
   assert.match(commands[0], /API_TOKEN=top-secret-value/);
   assert.doesNotMatch(result.command, /top-secret-value/);
-  assert.match(result.command, /API_TOKEN=/);
+  assert.match(result.command, /API_TOKEN='\[REDACTED\]'/);
 });
 
 test("redacts Eve environment values from command errors", async () => {
@@ -130,7 +130,7 @@ test("redacts Eve environment values from command errors", async () => {
     (error) => {
       assert.doesNotMatch(error.message, /top-secret-value/);
       assert.doesNotMatch(error.command, /top-secret-value/);
-      assert.match(error.command, /API_TOKEN=/);
+      assert.match(error.command, /API_TOKEN='\[REDACTED\]'/);
       return true;
     },
   );
