@@ -29,7 +29,7 @@ import { runAgentBrowser } from "@agent-browser/sandbox/eve";
 const result = await runAgentBrowser(ctx, ["open", "https://example.com"]);
 ```
 
-The Eve helper derives a short, stable `agent-browser` session name from the Eve sandbox id. Pass `session` to `runAgentBrowser` when multiple independent browser sessions should share one sandbox.
+The Eve helper derives a short, stable `agent-browser` session name from the Eve sandbox id. Pass `session` to `runAgentBrowser` when multiple independent browser sessions should share one sandbox. Environment values supplied through `env` are redacted from command results and errors.
 
 ## Vercel Sandbox
 
