@@ -174,11 +174,16 @@ export async function runAgentBrowser<TJson = unknown>(
 
   const session = options.session ?? defaultSessionName(options.sessionPrefix ?? "eve", sandbox.id);
   const command = buildAgentBrowserCommand(args, { ...options, session });
+  const reportedCommand = buildAgentBrowserCommand(args, {
+    ...options,
+    env: redactEnvironmentValues(options.env),
+    session,
+  });
   const result = await sandbox.run({ abortSignal: options.abortSignal, command });
 
   return throwIfCommandFailed(
     createAgentBrowserCommandResult<TJson>({
-      command,
+      command: reportedCommand,
       exitCode: result.exitCode,
       stderr: result.stderr,
       stdout: result.stdout,
@@ -191,6 +196,15 @@ export function buildAgentBrowserCommand(
   options: EveRunAgentBrowserOptions = {},
 ): string {
   return buildShellCommand(args, options);
+}
+
+function redactEnvironmentValues(
+  env: Readonly<Record<string, string | undefined>> | undefined,
+): Readonly<Record<string, string | undefined>> | undefined {
+  if (env === undefined) return undefined;
+  return Object.fromEntries(
+    Object.entries(env).map(([key, value]) => [key, value === undefined ? undefined : "[REDACTED]"]),
+  );
 }
 
 function buildLinuxSystemDependenciesCommand(): string {
