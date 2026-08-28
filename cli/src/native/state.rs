@@ -551,7 +551,7 @@ fn is_state_file(path: &std::path::Path) -> bool {
 
 fn is_encrypted_state(path: &std::path::Path) -> bool {
     let path = path.to_string_lossy();
-    path.ends_with(".json.enc") || path.ends_with(".json.enc.previous")
+    path.ends_with(".enc") || path.ends_with(".enc.previous")
 }
 
 pub fn state_list() -> Result<Value, String> {
@@ -986,6 +986,26 @@ mod tests {
         assert_ne!(&encrypted[12..], plain);
         let decrypted = decrypt_data(&encrypted, key).unwrap();
         assert_eq!(decrypted, plain);
+    }
+
+    #[test]
+    fn test_state_show_reads_custom_encrypted_path() {
+        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_ENCRYPTION_KEY"]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.enc");
+        let key = "test-secret-key";
+        guard.set("AGENT_BROWSER_ENCRYPTION_KEY", key);
+
+        let state = StorageState {
+            cookies: vec![],
+            origins: vec![],
+        };
+        let json = serde_json::to_vec(&state).unwrap();
+        fs::write(&path, encrypt_data(&json, key).unwrap()).unwrap();
+
+        let shown = state_show(path.to_str().unwrap()).unwrap();
+        assert_eq!(shown["encrypted"], true);
+        assert_eq!(shown["summary"], "0 cookies, 0 origins");
     }
 
     #[test]
