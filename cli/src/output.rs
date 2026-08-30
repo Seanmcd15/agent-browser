@@ -3155,7 +3155,9 @@ Common tools include:
   agent_browser_close      Close the browser session
 
 Each tool has typed fields such as url, selector, text, key, and session.
-Each tool also accepts extraArgs for advanced CLI flags and exact CLI parity.
+Each tool also accepts extraArgs for advanced CLI flags. Safety policy flags
+(--allowed-domains, --action-policy, --confirm-actions, --confirm-interactive,
+and --config) must be configured in the MCP server environment or project config.
 Tool discovery is paginated and includes read-only/open-world annotations so
 modern MCP clients can load the large typed surface incrementally.
 Use agent_browser_snapshot after navigation to get fresh refs before clicking.
