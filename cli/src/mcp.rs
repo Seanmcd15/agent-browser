@@ -1877,7 +1877,7 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         json!({
             "type": "array",
             "items": { "type": "string" },
-            "description": "Advanced: extra CLI arguments for this command, preserving full CLI parity."
+            "description": "Advanced: extra CLI arguments for this command. Safety policy flags must be configured by the MCP server operator."
         }),
     );
     props.insert(
@@ -2249,6 +2249,7 @@ fn call_cli_tool(
     let session = optional_string(arguments, "session")?;
     let timeout_ms = optional_timeout(arguments)?;
     let extra_args = optional_string_array(arguments, "extraArgs")?.unwrap_or_default();
+    validate_extra_args(&extra_args)?;
 
     let mut cli_args = vec!["--json".to_string()];
     append_common_global_args(&mut cli_args, arguments, session.as_deref())?;
@@ -2259,6 +2260,33 @@ fn call_cli_tool(
         ProtocolError::invalid_params(format!("Failed to run agent-browser: {}", e))
     })?;
     Ok(tool_result_from_run(run))
+}
+
+/// Prevent an MCP tool caller from replacing policy configured by the server operator.
+///
+/// `extraArgs` is appended after inherited environment and project configuration, so
+/// these CLI flags would otherwise win during parsing and could widen network access
+/// or disable action confirmation for the shared daemon.
+fn validate_extra_args(extra_args: &[String]) -> Result<(), ProtocolError> {
+    const PROTECTED_FLAGS: &[&str] = &[
+        "--allowed-domains",
+        "--action-policy",
+        "--confirm-actions",
+        "--confirm-interactive",
+        "--config",
+    ];
+
+    if let Some(flag) = extra_args
+        .iter()
+        .find(|arg| PROTECTED_FLAGS.contains(&arg.as_str()))
+    {
+        return Err(ProtocolError::invalid_params(format!(
+            "extraArgs cannot override MCP safety policy with {}; configure this option through the MCP server environment or project configuration",
+            flag
+        )));
+    }
+
+    Ok(())
 }
 
 fn command_parts(command: &str) -> Vec<String> {
@@ -3945,6 +3973,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(args, vec!["--session", "work", "--restore=open"]);
+    }
+
+    #[test]
+    fn extra_args_cannot_override_mcp_safety_policy() {
+        for flag in [
+            "--allowed-domains",
+            "--action-policy",
+            "--confirm-actions",
+            "--confirm-interactive",
+            "--config",
+        ] {
+            let arguments = json!({
+                "extraArgs": [flag, "attacker-controlled"]
+            });
+            let err = call_cli_tool(&arguments, vec!["get".to_string(), "url".to_string()], None)
+                .expect_err("safety policy flags must be rejected");
+
+            assert_eq!(err.code, -32602);
+            assert!(
+                err.message.contains(flag),
+                "error should identify rejected flag {flag}: {}",
+                err.message
+            );
+        }
     }
 
     #[test]
