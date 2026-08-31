@@ -659,7 +659,7 @@ Common tools include:
 
 Each tool has typed fields such as `url`, `selector`, `text`, `key`, and `session`, so MCP clients show meaningful approval prompts instead of raw command arrays. Each tool also accepts `extraArgs` for advanced CLI flags and exact CLI parity. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally.
 
-Tool invocations use the same config files and environment variables as the CLI. Use `session` in the tool arguments, or set `AGENT_BROWSER_SESSION`, to isolate browser state.
+Tool invocations use the same config files and environment variables as the CLI. Security options supplied on the MCP startup command, including `--allowed-domains`, `--action-policy`, and `--confirm-actions`, are enforced by every delegated tool invocation. Use `session` in the tool arguments, or set `AGENT_BROWSER_SESSION`, to isolate browser state.
 
 ## Command chaining
 

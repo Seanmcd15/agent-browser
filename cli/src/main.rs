@@ -1019,6 +1019,14 @@ fn main() {
     // Handle MCP stdio server mode. This must never share stdout with normal
     // CLI output because stdout is reserved for JSON-RPC protocol messages.
     if clean.first().map(|s| s.as_str()) == Some("mcp") {
+        if let Err(err) = mcp::preserve_startup_security(
+            flags.allowed_domains.as_deref(),
+            flags.action_policy.as_deref(),
+            flags.confirm_actions.as_deref(),
+        ) {
+            eprintln!("{} {}", color::error_indicator(), err);
+            exit(1);
+        }
         if let Err(err) = mcp::run_mcp(&clean[1..]) {
             eprintln!("{} {}", color::error_indicator(), err);
             exit(1);

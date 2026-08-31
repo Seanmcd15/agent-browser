@@ -545,7 +545,7 @@ Full parity MCP client config:
 }
 ```
 
-Tool invocations use the same config files and environment variables as the CLI. Use `session` in the tool arguments, or set `AGENT_BROWSER_SESSION`, to isolate browser state.
+Tool invocations use the same config files and environment variables as the CLI. Security options supplied on the MCP startup command, including `--allowed-domains`, `--action-policy`, and `--confirm-actions`, are enforced by every delegated tool invocation. Use `session` in the tool arguments, or set `AGENT_BROWSER_SESSION`, to isolate browser state.
 
 ## Authentication
 

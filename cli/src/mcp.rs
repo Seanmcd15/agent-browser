@@ -18,6 +18,34 @@ const PROTOCOL_VERSION: &str = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const TOOL_LIST_PAGE_SIZE: usize = 64;
+
+/// Preserve security options parsed by the MCP parent for delegated CLI
+/// subprocesses. MCP tools execute by spawning this binary again, so argv-only
+/// values must be promoted to inherited environment variables before serving.
+pub fn preserve_startup_security(
+    allowed_domains: Option<&[String]>,
+    action_policy: Option<&str>,
+    confirm_actions: Option<&str>,
+) -> Result<(), String> {
+    if let Some(domains) = allowed_domains {
+        set_startup_security_env("AGENT_BROWSER_ALLOWED_DOMAINS", &domains.join(","))?;
+    }
+    if let Some(path) = action_policy {
+        set_startup_security_env("AGENT_BROWSER_ACTION_POLICY", path)?;
+    }
+    if let Some(actions) = confirm_actions {
+        set_startup_security_env("AGENT_BROWSER_CONFIRM_ACTIONS", actions)?;
+    }
+    Ok(())
+}
+
+fn set_startup_security_env(name: &str, value: &str) -> Result<(), String> {
+    if value.contains('\0') {
+        return Err(format!("Invalid {} value: contains NUL", name));
+    }
+    env::set_var(name, value);
+    Ok(())
+}
 const TOOL_OPEN: &str = "agent_browser_open";
 const TOOL_READ: &str = "agent_browser_read";
 const TOOL_BACK: &str = "agent_browser_back";
@@ -4030,5 +4058,44 @@ mod tests {
     fn initialize_defaults_to_latest_protocol_version() {
         let result = initialize_result(None, &McpConfig::default());
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn preserve_startup_security_exports_all_child_settings() {
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_ACTION_POLICY",
+            "AGENT_BROWSER_CONFIRM_ACTIONS",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_ACTION_POLICY");
+        guard.remove("AGENT_BROWSER_CONFIRM_ACTIONS");
+
+        preserve_startup_security(
+            Some(&["example.com".to_string(), "*.example.com".to_string()]),
+            Some("/tmp/policy.json"),
+            Some("navigate,eval"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            env::var("AGENT_BROWSER_ALLOWED_DOMAINS").unwrap(),
+            "example.com,*.example.com"
+        );
+        assert_eq!(
+            env::var("AGENT_BROWSER_ACTION_POLICY").unwrap(),
+            "/tmp/policy.json"
+        );
+        assert_eq!(
+            env::var("AGENT_BROWSER_CONFIRM_ACTIONS").unwrap(),
+            "navigate,eval"
+        );
+    }
+
+    #[test]
+    fn preserve_startup_security_rejects_nul_values() {
+        let err = preserve_startup_security(None, Some("policy\0.json"), None).unwrap_err();
+        assert!(err.contains("AGENT_BROWSER_ACTION_POLICY"));
+        assert!(err.contains("NUL"));
     }
 }
