@@ -3159,6 +3159,8 @@ Each tool also accepts extraArgs for advanced CLI flags and exact CLI parity.
 Tool discovery is paginated and includes read-only/open-world annotations so
 modern MCP clients can load the large typed surface incrementally.
 Use agent_browser_snapshot after navigation to get fresh refs before clicking.
+Security options on the MCP startup command, including --allowed-domains,
+--action-policy, and --confirm-actions, apply to every tool invocation.
 
 MCP client config example:
   {
