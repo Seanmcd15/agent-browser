@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import {
   agentBrowserRevalidationKey,
@@ -8,14 +13,16 @@ import {
   runAgentBrowser,
 } from "../dist/eve.js";
 
+const execFileAsync = promisify(execFile);
+
 test("builds Eve revalidation key from install options", () => {
   assert.equal(
     agentBrowserRevalidationKey({ installSpec: "agent-browser@1.2.3" }),
-    "agent-browser:bootstrap-3:agent-browser@1.2.3:browser:system-deps",
+    "agent-browser:bootstrap-4:agent-browser@1.2.3:browser:system-deps",
   );
   assert.equal(
     agentBrowserRevalidationKey({ installSpec: "agent-browser@1.2.3", installSystemDependencies: false }),
-    "agent-browser:bootstrap-3:agent-browser@1.2.3:browser:no-system-deps",
+    "agent-browser:bootstrap-4:agent-browser@1.2.3:browser:no-system-deps",
   );
 });
 
@@ -47,6 +54,97 @@ test("installs agent-browser in an Eve sandbox", async () => {
   assert.match(commands[0], /sudo dnf install -y --skip-broken -- glib2 nss/);
   assert.equal(commands[1], "npm install -g agent-browser@1.2.3");
   assert.equal(commands[2], "agent-browser install");
+});
+
+test("validates the Eve apt plan before installing packages", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-browser-eve-apt-"));
+  const installMarker = join(directory, "install-ran");
+  const writeExecutable = async (name, contents) => {
+    const path = join(directory, name);
+    await writeFile(path, contents);
+    await chmod(path, 0o755);
+  };
+
+  try {
+    await writeExecutable("sudo", "#!/bin/sh\nexec \"$@\"\n");
+    await writeExecutable(
+      "apt-get",
+      [
+        "#!/bin/sh",
+        "if [ \"$1\" = update ]; then exit 0; fi",
+        "if [ \"$1\" = install ] && [ \"$2\" = --simulate ]; then",
+        "  printf '%s\\n' \"$APT_SIMULATION_OUTPUT\"",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = install ] && [ \"$2\" = -y ]; then",
+        "  : > \"$INSTALL_MARKER\"",
+        "  exit 0",
+        "fi",
+        "exit 1",
+        "",
+      ].join("\n"),
+    );
+    await writeExecutable("apt-cache", "#!/bin/sh\nexit 1\n");
+    await writeExecutable(
+      "grep",
+      [
+        "#!/bin/sh",
+        "while IFS= read -r line; do",
+        "  case \"$line\" in 'Remv '*) exit 0;; esac",
+        "done",
+        "exit 1",
+        "",
+      ].join("\n"),
+    );
+    await writeExecutable("ldconfig", "#!/bin/sh\nexit 0\n");
+
+    let simulationOutput = "Remv critical-package [1.0]";
+    let invocation = 0;
+    const sandbox = {
+      id: "sandbox-1",
+      async run({ command }) {
+        invocation += 1;
+        if (invocation > 1) {
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        try {
+          const result = await execFileAsync("/bin/sh", ["-c", command], {
+            env: { APT_SIMULATION_OUTPUT: simulationOutput, INSTALL_MARKER: installMarker, PATH: directory },
+          });
+          return { exitCode: 0, stdout: result.stdout, stderr: result.stderr };
+        } catch (error) {
+          return {
+            exitCode: typeof error.code === "number" ? error.code : 1,
+            stdout: error.stdout ?? "",
+            stderr: error.stderr ?? "",
+          };
+        }
+      },
+    };
+
+    await assert.rejects(
+      () => installAgentBrowser(sandbox, { installSpec: "agent-browser@1.2.3" }),
+      /apt would remove installed packages/,
+    );
+    await assert.rejects(() => access(installMarker), { code: "ENOENT" });
+
+    simulationOutput = "";
+    invocation = 0;
+    await installAgentBrowser(sandbox, { installSpec: "agent-browser@1.2.3" });
+    await access(installMarker);
+
+    await rm(installMarker);
+    await rm(join(directory, "grep"));
+    simulationOutput = "Remv critical-package [1.0]";
+    invocation = 0;
+    await assert.rejects(
+      () => installAgentBrowser(sandbox, { installSpec: "agent-browser@1.2.3" }),
+      /could not check apt simulation for package removals/,
+    );
+    await assert.rejects(() => access(installMarker), { code: "ENOENT" });
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
 });
 
 test("skips Eve system dependencies when explicitly disabled", async () => {

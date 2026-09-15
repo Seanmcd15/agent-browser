@@ -115,7 +115,7 @@ const DNF_CHROMIUM_DEPENDENCIES = [
   "dbus-libs",
 ] as const;
 
-const EVE_BOOTSTRAP_REVISION = "3";
+const EVE_BOOTSTRAP_REVISION = "4";
 
 export function agentBrowserRevalidationKey(options: AgentBrowserInstallOptions = {}): string {
   return [
@@ -198,7 +198,11 @@ function buildLinuxSystemDependenciesCommand(): string {
   const dnfPackages = DNF_CHROMIUM_DEPENDENCIES.map(quoteShellArg).join(" ");
   return [
     "if command -v apt-get >/dev/null 2>&1; then",
-    `sudo apt-get update && sudo apt-get install -y --no-install-recommends ${aptPackages} && sudo ldconfig;`,
+    "sudo apt-get update || exit 1;",
+    `apt_simulation="$(sudo apt-get install --simulate --no-install-recommends ${aptPackages} 2>&1)" || { printf '%s\\n' 'Aborting: apt could not install the required browser dependencies.' "$apt_simulation" >&2; exit 1; };`,
+    "printf '%s\\n' \"$apt_simulation\" | grep -q '^Remv '; apt_removal_check_status=$?;",
+    `if [ "$apt_removal_check_status" -eq 0 ]; then printf '%s\\n' 'Aborting: apt would remove installed packages to install browser dependencies.' "$apt_simulation" >&2; exit 1; elif [ "$apt_removal_check_status" -ne 1 ]; then printf '%s\\n' 'Aborting: could not check apt simulation for package removals.' >&2; exit 1; fi;`,
+    `sudo apt-get install -y --no-install-recommends ${aptPackages} && sudo ldconfig;`,
     "elif command -v dnf >/dev/null 2>&1; then",
     `sudo dnf clean all && sudo dnf install -y --skip-broken -- ${dnfPackages} && sudo ldconfig;`,
     "else echo 'No supported package manager found for browser system dependencies.' >&2; exit 1; fi",
