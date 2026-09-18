@@ -60,6 +60,8 @@ const AUTH_LOGIN_SELECTOR_POLL_INTERVAL_MS: u64 = 100;
 const AUTH_LOGIN_PREFERRED_SELECTOR_WINDOW_MS: u64 = 5_000;
 
 pub struct PendingConfirmation {
+    /// ID returned to the caller and required to approve or deny this exact command.
+    confirmation_id: String,
     pub action: String,
     pub cmd: Value,
     approved_actions: Vec<String>,
@@ -1676,7 +1678,17 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             }
         }
         if let Some(policy_action) = confirmation_required {
+            if matches!(action, "confirm" | "deny") {
+                return error_response(
+                    &id,
+                    &format!(
+                        "Action '{}' cannot itself require confirmation",
+                        policy_action
+                    ),
+                );
+            }
             state.pending_confirmation = Some(PendingConfirmation {
+                confirmation_id: id.clone(),
                 action: policy_action.clone(),
                 cmd: cmd.clone(),
                 approved_actions: state.confirmed_policy_actions.iter().cloned().collect(),
@@ -1702,6 +1714,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                 }
                 if ca.requires_confirmation(policy_action) {
                     state.pending_confirmation = Some(PendingConfirmation {
+                        confirmation_id: id.clone(),
                         action: policy_action.to_string(),
                         cmd: cmd.clone(),
                         approved_actions: state.confirmed_policy_actions.iter().cloned().collect(),
@@ -8883,11 +8896,33 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
 // Confirmation handlers (stub)
 // ---------------------------------------------------------------------------
 
-async fn handle_confirm(_cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+fn take_matching_pending_confirmation(
+    cmd: &Value,
+    state: &mut DaemonState,
+) -> Result<PendingConfirmation, String> {
     let pending = state
         .pending_confirmation
-        .take()
+        .as_ref()
         .ok_or("No pending confirmation")?;
+    let confirmation_id = cmd
+        .get("confirmationId")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'confirmationId' parameter")?;
+    if pending.confirmation_id != confirmation_id {
+        return Err(format!(
+            "Confirmation ID '{}' does not match the pending action",
+            confirmation_id
+        ));
+    }
+
+    state
+        .pending_confirmation
+        .take()
+        .ok_or_else(|| "No pending confirmation".to_string())
+}
+
+async fn handle_confirm(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let pending = take_matching_pending_confirmation(cmd, state)?;
 
     let mut approved_actions = pending.approved_actions.clone();
     if !approved_actions.iter().any(|a| a == &pending.action) {
@@ -8903,11 +8938,8 @@ async fn handle_confirm(_cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     Ok(json!({ "confirmed": true, "action": pending.action, "result": result }))
 }
 
-async fn handle_deny(_cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let pending = state
-        .pending_confirmation
-        .take()
-        .ok_or("No pending confirmation")?;
+async fn handle_deny(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let pending = take_matching_pending_confirmation(cmd, state)?;
 
     Ok(json!({ "denied": true, "action": pending.action }))
 }
@@ -9997,6 +10029,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_confirm_rejects_mismatched_id_without_consuming_pending_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("policy.json");
+        fs::write(&policy_path, r#"{"confirm":["session_info"]}"#).unwrap();
+
+        let mut state = DaemonState::new();
+        state.policy = Some(ActionPolicy::load(policy_path.to_str().unwrap()).unwrap());
+
+        let first = execute_command(
+            &json!({ "id": "confirmation-a", "action": "session_info" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(first["data"]["confirmation_required"], true);
+
+        let second = execute_command(
+            &json!({ "id": "confirmation-b", "action": "session_info" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(second["data"]["confirmation_required"], true);
+
+        let response = execute_command(
+            &json!({
+                "id": "confirm-a",
+                "action": "confirm",
+                "confirmationId": "confirmation-a"
+            }),
+            &mut state,
+        )
+        .await;
+
+        assert_eq!(response["success"], false);
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("confirmation-a"));
+        assert_eq!(
+            state.pending_confirmation.as_ref().unwrap().cmd["id"],
+            "confirmation-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deny_rejects_mismatched_id_without_consuming_pending_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("policy.json");
+        fs::write(&policy_path, r#"{"confirm":["session_info"]}"#).unwrap();
+
+        let mut state = DaemonState::new();
+        state.policy = Some(ActionPolicy::load(policy_path.to_str().unwrap()).unwrap());
+
+        let pending = execute_command(
+            &json!({ "id": "confirmation-b", "action": "session_info" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(pending["data"]["confirmation_required"], true);
+
+        let response = execute_command(
+            &json!({
+                "id": "deny-a",
+                "action": "deny",
+                "confirmationId": "confirmation-a"
+            }),
+            &mut state,
+        )
+        .await;
+
+        assert_eq!(response["success"], false);
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("confirmation-a"));
+        assert_eq!(
+            state.pending_confirmation.as_ref().unwrap().cmd["id"],
+            "confirmation-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_confirmation_control_action_cannot_replace_pending_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("policy.json");
+        fs::write(&policy_path, r#"{"confirm":["session_info","confirm"]}"#).unwrap();
+
+        let mut state = DaemonState::new();
+        state.policy = Some(ActionPolicy::load(policy_path.to_str().unwrap()).unwrap());
+
+        let pending = execute_command(
+            &json!({ "id": "confirmation-a", "action": "session_info" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(pending["data"]["confirmation_required"], true);
+
+        let response = execute_command(
+            &json!({
+                "id": "confirm-a",
+                "action": "confirm",
+                "confirmationId": "confirmation-a"
+            }),
+            &mut state,
+        )
+        .await;
+
+        assert_eq!(response["success"], false);
+        assert_eq!(
+            state.pending_confirmation.as_ref().unwrap().cmd["id"],
+            "confirmation-a"
+        );
+    }
+
+    #[tokio::test]
     async fn test_confirm_rechecks_unapproved_plugin_action() {
         let guard = EnvGuard::new(&["AGENT_BROWSER_PROVIDER"]);
         guard.remove("AGENT_BROWSER_PROVIDER");
@@ -10028,7 +10174,11 @@ mod tests {
         assert_eq!(first["data"]["action"], "navigate");
 
         let second = execute_command(
-            &json!({ "id": "policy-plugin-confirm-2", "action": "confirm" }),
+            &json!({
+                "id": "policy-plugin-confirm-2",
+                "action": "confirm",
+                "confirmationId": "policy-plugin-confirm"
+            }),
             &mut state,
         )
         .await;
