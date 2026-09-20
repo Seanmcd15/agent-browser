@@ -3172,6 +3172,62 @@ async fn handle_url(state: &DaemonState) -> Result<Value, String> {
     Ok(json!({ "url": url }))
 }
 
+fn active_read_html_script(webdriver: bool) -> String {
+    let body = format!(
+        r#"const serialized = document.documentElement ? document.documentElement.outerHTML : "";
+const html = typeof serialized === "string" ? serialized : "";
+const limit = {};
+let end = html.length < limit ? html.length : limit;
+if (end < html.length && end > 0) {{
+  const last = html[end - 1];
+  if (last >= "\uD800" && last <= "\uDBFF") end--;
+}}
+let content = html;
+if (end < html.length) {{
+  content = "";
+  for (let i = 0; i < end; i++) content += html[i];
+}}
+const result = {{ html: content, truncated: end < html.length }};"#,
+        crate::read::ACTIVE_DOM_CHAR_LIMIT
+    );
+    if webdriver {
+        format!("{body}\nreturn result;")
+    } else {
+        format!("(() => {{\n{body}\nreturn result;\n}})()")
+    }
+}
+
+fn parse_active_read_html(result: Value) -> Result<(String, bool), String> {
+    let html = result
+        .get("html")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Active tab content is unavailable".to_string())?
+        .to_string();
+    let truncated = result
+        .get("truncated")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    Ok((html, truncated))
+}
+
+/// Read active-tab HTML with a page-side cap so a hostile or accidental giant
+/// DOM cannot force an unbounded string through WebDriver/CDP into the daemon.
+async fn handle_active_read_content(state: &DaemonState) -> Result<(String, bool, String), String> {
+    if let Some(ref wb) = state.webdriver_backend {
+        if state.browser.is_none() {
+            let result = wb.evaluate(&active_read_html_script(true)).await?;
+            let (html, truncated) = parse_active_read_html(result)?;
+            let url = wb.get_url().await.unwrap_or_default();
+            return Ok((html, truncated, url));
+        }
+    }
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let result = mgr.evaluate(&active_read_html_script(false), None).await?;
+    let (html, truncated) = parse_active_read_html(result)?;
+    let url = mgr.get_url().await.unwrap_or_default();
+    Ok((html, truncated, url))
+}
+
 async fn handle_read(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
     let mut options = crate::read::options_from_command(cmd)?;
     if let Some(allowed_domains) = {
@@ -3199,20 +3255,14 @@ async fn handle_read(cmd: &Value, state: &DaemonState) -> Result<Value, String> 
         return crate::read::run_read(active_url, options).await;
     }
 
-    let content_data = handle_content(state).await?;
-    let html = content_data
-        .get("html")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "Active tab content is unavailable".to_string())?;
-    let origin = content_data
-        .get("origin")
-        .and_then(|v| v.as_str())
-        .filter(|origin| !origin.is_empty())
-        .unwrap_or(active_url);
+    let (html, truncated, origin) = handle_active_read_content(state).await?;
+    let origin = if origin.is_empty() {
+        active_url
+    } else {
+        origin.as_str()
+    };
     Ok(crate::read::read_json_from_active_html(
-        origin,
-        html.to_string(),
-        &options,
+        origin, html, truncated, &options,
     ))
 }
 
@@ -9444,6 +9494,53 @@ mod tests {
         (port, handle)
     }
 
+    async fn start_active_read_webdriver_server(
+        html: &'static str,
+        truncated: bool,
+    ) -> (u16, tokio::task::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            for request_index in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let body = match request_index {
+                    0 | 2 => {
+                        assert!(request.starts_with("GET /session/test-session/url "));
+                        json!({ "value": "https://example.com/app" })
+                    }
+                    1 => {
+                        assert!(request.starts_with("POST /session/test-session/execute/sync "));
+                        assert!(request.contains("outerHTML"));
+                        assert!(!request.contains("slice("));
+                        assert!(request.contains("\\\\uD800"));
+                        assert!(request.contains("\\\\uDBFF"));
+                        assert!(request.contains("for (let i = 0; i < end; i++)"));
+                        assert!(request.contains("2097152"));
+                        json!({
+                            "value": {
+                                "html": html,
+                                "truncated": truncated
+                            }
+                        })
+                    }
+                    _ => unreachable!(),
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            3
+        });
+        (port, handle)
+    }
+
     fn unique_socket_dir(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -9961,16 +10058,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_without_url_allows_matching_active_tab() {
-        let (port, server) = start_webdriver_response_server(vec![
-            (
-                "/session/test-session/url",
-                json!({ "value": "https://example.com/app" }),
-            ),
-            (
-                "/session/test-session/source",
-                json!({ "value": "<html><body><h1>Account</h1><p>Signed in.</p></body></html>" }),
-            ),
-        ])
+        let (port, server) = start_active_read_webdriver_server(
+            "<html><body><h1>Account</h1><p>Signed in.</p></body></html>",
+            false,
+        )
         .await;
         let mut state = DaemonState::new();
         state.backend_type = BackendType::WebDriver;
@@ -9993,7 +10084,33 @@ mod tests {
         let content = resp["data"]["content"].as_str().unwrap();
         assert!(content.contains("# Account"));
         assert!(content.contains("Signed in."));
-        assert_eq!(server.await.unwrap(), 2);
+        assert_eq!(server.await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_read_without_url_limits_dom_before_webdriver_transfer() {
+        let (port, server) =
+            start_active_read_webdriver_server("<html><body><h1>Prefix</h1></body></html>", true)
+                .await;
+        let mut state = DaemonState::new();
+        state.backend_type = BackendType::WebDriver;
+        state.webdriver_backend = Some(WebDriverBackend::new(
+            crate::native::webdriver::client::WebDriverClient::new_with_session(
+                port,
+                "test-session".to_string(),
+            ),
+        ));
+
+        let resp = execute_command(
+            &json!({ "action": "read", "id": "read-active-tab-limited" }),
+            &mut state,
+        )
+        .await;
+
+        assert_eq!(resp["success"], true);
+        assert_eq!(resp["data"]["truncated"], true);
+        assert!(resp["data"]["content"].as_str().unwrap().contains("Prefix"));
+        assert_eq!(server.await.unwrap(), 3);
     }
 
     #[tokio::test]

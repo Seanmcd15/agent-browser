@@ -756,7 +756,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_READ,
             "Read URL",
-            "Fetch a URL as agent-readable text, preferring text/markdown. Omit url to read the active tab.",
+            "Fetch a URL as agent-readable text, preferring text/markdown. Omit url to read the active tab; its DOM transfer is capped and JSON reports truncation.",
             json!({
                 "url": { "type": "string", "description": "URL to read. Bare hosts are normalized to https. Omit to read the active tab." },
                 "raw": { "type": "boolean", "description": "Return the response body without HTML extraction." },
