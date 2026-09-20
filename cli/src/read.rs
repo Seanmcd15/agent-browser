@@ -9,6 +9,8 @@ use url::Url;
 
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// Maximum UTF-16 code units copied from an active tab into the daemon.
+pub(crate) const ACTIVE_DOM_CHAR_LIMIT: usize = 2 * 1024 * 1024;
 const READ_ACCEPT: &str = "text/markdown, text/plain;q=0.9, text/html;q=0.7, */*;q=0.1";
 const USER_AGENT_VALUE: &str = concat!("agent-browser/", env!("CARGO_PKG_VERSION"), " read");
 
@@ -427,7 +429,12 @@ fn read_json_from_content(
     }
 }
 
-pub fn read_json_from_active_html(active_url: &str, html: String, options: &ReadOptions) -> Value {
+pub fn read_json_from_active_html(
+    active_url: &str,
+    html: String,
+    truncated: bool,
+    options: &ReadOptions,
+) -> Value {
     let (source, content) = if options.raw {
         ("active-tab-raw", html)
     } else {
@@ -452,7 +459,7 @@ pub fn read_json_from_active_html(active_url: &str, html: String, options: &Read
         "finalUrl": active_url,
         "contentType": "text/html",
         "source": source,
-        "truncated": false,
+        "truncated": truncated,
         "content": content,
     })
 }
@@ -1365,8 +1372,12 @@ Inline [Authentication](/inline-auth) should not become a TOC item.
         };
         let html = "<html><body><h1>Home</h1><p>Welcome.</p><h2>Account</h2><p>Signed in.</p></body></html>";
 
-        let data =
-            read_json_from_active_html("https://example.com/app", html.to_string(), &options);
+        let data = read_json_from_active_html(
+            "https://example.com/app",
+            html.to_string(),
+            false,
+            &options,
+        );
 
         assert_eq!(data["source"], "active-tab-html-filtered");
         assert_eq!(data["finalUrl"], "https://example.com/app");

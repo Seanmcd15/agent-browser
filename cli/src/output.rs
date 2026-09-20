@@ -1354,6 +1354,8 @@ markdown with Accept: text/markdown, try the same URL with .md appended when
 the first response is not markdown, walk ancestor paths toward / to find the
 nearest llms.txt for a matching docs link, fall back to plain text or readable
 text extracted from HTML, and print only the document content by default.
+Active-tab reads cap the DOM transfer at roughly 2 million characters and
+report truncation in JSON output.
 Use --outline for a compact heading outline of a single page. Use --llms index
 or --llms full for nearest-ancestor llms files; with no URL, --llms and
 --require-md use the active tab URL because they depend on HTTP resources.
