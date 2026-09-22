@@ -16,9 +16,9 @@
 /// to call `hook.inject()` is react-dom. In Turbopack RSC apps (e.g. Next.js
 /// 16.3+) the `react-server-dom-*` Flight client registers first as id 1 with
 /// zero fiber roots, so `get(1)` read an empty tree and every `react` command
-/// silently reported nothing. Instead, pick the first non-Flight renderer that
-/// has mounted fiber roots, falling back to any renderer with roots, then any
-/// renderer at all.
+/// silently reported nothing. Instead, prefer ReactDOM when it has mounted
+/// roots, falling back to another non-Flight renderer with roots, then any
+/// renderer with roots, then any renderer at all.
 pub const PICK_REACT_RENDERER: &str = r#"
   function __abPickReactRendererId(hook) {
     const ris = hook && hook.rendererInterfaces;
@@ -26,20 +26,25 @@ pub const PICK_REACT_RENDERER: &str = r#"
     const rootsOf = (id) => {
       try { return hook.getFiberRoots ? hook.getFiberRoots(id).size : 0; } catch (e) { return 0; }
     };
-    const isFlight = (id) => {
+    const packageNameOf = (id) => {
       const r = hook.renderers && hook.renderers.get && hook.renderers.get(id);
-      return /react-server-dom/.test((r && r.rendererPackageName) || "");
+      return (r && r.rendererPackageName) || "";
     };
-    let firstWithRoots = null, firstAny = null;
+    const isDom = (id) => /^react-dom(?:$|\/)/.test(packageNameOf(id));
+    const isFlight = (id) => /react-server-dom/.test(packageNameOf(id));
+    let firstNonFlightWithRoots = null, firstWithRoots = null, firstAny = null;
     for (const id of ris.keys()) {
       if (!ris.get(id)) continue;
       if (firstAny === null) firstAny = id;
       if (rootsOf(id) > 0) {
         if (firstWithRoots === null) firstWithRoots = id;
-        if (!isFlight(id)) return id;
+        if (isDom(id)) return id;
+        if (!isFlight(id) && firstNonFlightWithRoots === null) firstNonFlightWithRoots = id;
       }
     }
-    return firstWithRoots !== null ? firstWithRoots : firstAny;
+    return firstNonFlightWithRoots !== null ? firstNonFlightWithRoots
+      : firstWithRoots !== null ? firstWithRoots
+      : firstAny;
   }
 "#;
 
@@ -830,13 +835,24 @@ mod tests {
         }
     }
 
-    /// The picker prefers a non-Flight renderer with mounted fiber roots and
-    /// falls back gracefully, never assuming a fixed renderer id.
+    /// The picker prefers ReactDOM, then another non-Flight renderer with
+    /// mounted roots, and falls back gracefully without assuming a fixed id.
     #[test]
     fn picker_skips_flight_and_falls_back() {
         assert!(PICK_REACT_RENDERER.contains("react-server-dom"));
         assert!(PICK_REACT_RENDERER.contains("getFiberRoots"));
+        assert!(PICK_REACT_RENDERER.contains("firstNonFlightWithRoots"));
         assert!(PICK_REACT_RENDERER.contains("firstWithRoots"));
         assert!(PICK_REACT_RENDERER.contains("firstAny"));
+    }
+
+    /// Mixed-renderer pages can mount another client renderer before
+    /// ReactDOM. The picker must positively identify ReactDOM instead of
+    /// returning the first rooted renderer that is merely not Flight.
+    #[test]
+    fn picker_prefers_react_dom_over_other_client_renderers() {
+        assert!(PICK_REACT_RENDERER.contains("const isDom"));
+        assert!(PICK_REACT_RENDERER.contains("react-dom"));
+        assert!(PICK_REACT_RENDERER.contains("if (isDom(id)) return id"));
     }
 }
