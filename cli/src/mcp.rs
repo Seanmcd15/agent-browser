@@ -1707,7 +1707,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_PLUGIN_RUN,
             "Plugin run",
-            "Run a command.run or custom plugin request.",
+            "Run a policy-gated command.run or custom plugin request. Confirmation-gated actions fail closed because MCP calls are noninteractive.",
             json!({
                 "name": { "type": "string", "description": "Configured plugin name." },
                 "requestType": { "type": "string", "description": "Namespaced request type to send to the plugin." },

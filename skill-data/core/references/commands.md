@@ -313,6 +313,8 @@ Other capabilities use the same protocol:
 
 `plugin run` is for `command.run` and custom capabilities. Core capabilities and protocol request types use their dedicated command paths.
 
+`plugin run` checks the configured `plugin:<name>:<capability>` action policy before starting the plugin process. Confirmation-gated calls require `--confirm-interactive` in a terminal and fail closed in noninteractive use.
+
 ## State Management
 
 ```bash

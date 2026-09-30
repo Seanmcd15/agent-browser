@@ -3262,6 +3262,9 @@ Core capabilities and protocol request types use dedicated command paths.
 Use auth login for credential.read, --provider for browser.provider, and
 a local launch for launch.mutate.
 
+plugin run enforces plugin:<name>:<capability> policy actions before execution.
+Confirmation-gated calls require --confirm-interactive in a terminal.
+
 Example config:
   {{
     "plugins": [
@@ -3439,6 +3442,8 @@ Plugins:
   plugin [list]              List configured plugins
   plugin show <name>         Show one configured plugin
   plugin run <name> <type>   Run a command.run or custom plugin request
+                             Enforces plugin:<name>:<capability> policy actions
+                             Confirmation requires --confirm-interactive and a terminal
 
 Confirmation:
   confirm <id>               Approve a pending action

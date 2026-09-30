@@ -817,7 +817,10 @@ Gate plugin access by capability action:
 agent-browser --confirm-actions plugin:vault:credential.read auth login my-app --credential-provider vault --item "My App"
 agent-browser --confirm-actions plugin:cloud-browser:browser.provider --provider cloud-browser open https://example.com
 agent-browser --confirm-actions plugin:stealth:launch.mutate open https://example.com
+agent-browser --confirm-actions plugin:captcha:captcha.solve --confirm-interactive plugin run captcha captcha.solve --payload '{"siteKey":"...","url":"https://example.com"}'
 ```
+
+`plugin run` enforces the configured `plugin:<name>:<capability>` action policy before starting the plugin process. It runs without daemon confirmation state, so confirmation-gated calls require `--confirm-interactive` in a terminal and fail closed otherwise.
 
 Do not put vault tokens or passwords in plugin command args. Use the vault vendor's own login/session mechanism or environment outside agent-browser config.
 
