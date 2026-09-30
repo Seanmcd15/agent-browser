@@ -313,6 +313,8 @@ Other capabilities use the same protocol:
 
 `plugin run` is for `command.run` and custom capabilities. Core capabilities and protocol request types use their dedicated command paths.
 
+`plugin run` checks the configured `plugin:<name>:<capability>` action policy before starting the plugin process. Confirmation-gated calls require `--confirm-interactive` in a terminal and fail closed in noninteractive use.
+
 ## State Management
 
 ```bash
@@ -373,7 +375,7 @@ agent-browser --proxy-bypass <hosts>  # Hosts to bypass proxy
 agent-browser --headers <json> ...    # HTTP headers scoped to URL's origin
 agent-browser --executable-path <p>   # Custom browser executable
 agent-browser --extension <path> ...  # Load browser extension (repeatable)
-agent-browser --ignore-https-errors   # Ignore SSL certificate errors
+agent-browser --ignore-https-errors   # Ignore SSL errors; changing it on launch restarts Chrome
 agent-browser --hide-scrollbars false # Keep native scrollbars visible in headless Chromium screenshots
 agent-browser --help                  # Show help (-h)
 agent-browser --version               # Show version (-V)

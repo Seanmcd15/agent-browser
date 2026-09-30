@@ -218,6 +218,8 @@ agent-browser plugin run captcha captcha.solve --payload '{"siteKey":"...","url"
 
 `plugin run` is for `command.run` and custom capabilities. Core capabilities and protocol request types use their dedicated command paths.
 
+Generic plugin commands enforce the `plugin:<name>:<capability>` action policy before execution. If the action requires confirmation, run `plugin run` with `--confirm-interactive` in a terminal; noninteractive calls fail closed.
+
 ### Persist session across runs
 
 ```bash

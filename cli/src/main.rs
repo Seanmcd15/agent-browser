@@ -1012,7 +1012,14 @@ fn main() {
         clean.first().map(|s| s.as_str()),
         Some("plugin") | Some("plugins")
     ) {
-        plugins::run_plugin_command(&clean, &flags.plugins, flags.json);
+        plugins::run_plugin_command(
+            &clean,
+            &flags.plugins,
+            flags.json,
+            flags.action_policy.as_deref(),
+            flags.confirm_actions.as_deref(),
+            flags.confirm_interactive,
+        );
         return;
     }
 

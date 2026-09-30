@@ -817,7 +817,10 @@ Gate plugin access by capability action:
 agent-browser --confirm-actions plugin:vault:credential.read auth login my-app --credential-provider vault --item "My App"
 agent-browser --confirm-actions plugin:cloud-browser:browser.provider --provider cloud-browser open https://example.com
 agent-browser --confirm-actions plugin:stealth:launch.mutate open https://example.com
+agent-browser --confirm-actions plugin:captcha:captcha.solve --confirm-interactive plugin run captcha captcha.solve --payload '{"siteKey":"...","url":"https://example.com"}'
 ```
+
+`plugin run` enforces the configured `plugin:<name>:<capability>` action policy before starting the plugin process. It runs without daemon confirmation state, so confirmation-gated calls require `--confirm-interactive` in a terminal and fail closed otherwise.
 
 Do not put vault tokens or passwords in plugin command args. Use the vault vendor's own login/session mechanism or environment outside agent-browser config.
 
@@ -889,7 +892,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--user-agent <ua>` | Custom User-Agent string (or `AGENT_BROWSER_USER_AGENT` env) |
 | `--proxy <url>` | Proxy server URL with optional auth (or `AGENT_BROWSER_PROXY` env) |
 | `--proxy-bypass <hosts>` | Hosts to bypass proxy (or `AGENT_BROWSER_PROXY_BYPASS` env) |
-| `--ignore-https-errors` | Ignore HTTPS certificate errors (useful for self-signed certs) |
+| `--ignore-https-errors` | Ignore HTTPS certificate errors (useful for self-signed certs). Changing this setting on an explicit launch restarts Chrome |
 | `--allow-file-access` | Allow file:// URLs to access local files (Chromium only) |
 | `--hide-scrollbars <bool>` | Hide native scrollbars in headless Chromium screenshots, enabled by default (or `AGENT_BROWSER_HIDE_SCROLLBARS` env) |
 | `-p, --provider <name>` | Browser provider, including configured `browser.provider` plugins (or `AGENT_BROWSER_PROVIDER` env) |

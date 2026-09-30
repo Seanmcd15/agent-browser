@@ -383,9 +383,12 @@ Plugin access is exposed as capability-scoped policy actions:
 agent-browser --confirm-actions plugin:vault:credential.read auth login my-app --credential-provider vault --item "My App"
 agent-browser --confirm-actions plugin:cloud-browser:browser.provider --provider cloud-browser open https://example.com
 agent-browser --confirm-actions plugin:stealth:launch.mutate open https://example.com
+agent-browser --confirm-actions plugin:captcha:captcha.solve --confirm-interactive plugin run captcha captcha.solve --payload '{"siteKey":"abc","url":"https://example.com"}'
 ```
 
 The action string is `plugin:<name>:<capability>`.
+
+`plugin run` checks this policy action before starting the plugin process. Because it runs without daemon confirmation state, a confirmation-gated call requires `--confirm-interactive` in a terminal and fails closed otherwise.
 
 ## Packaging guidance
 

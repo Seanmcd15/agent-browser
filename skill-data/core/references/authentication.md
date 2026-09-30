@@ -205,6 +205,8 @@ agent-browser plugin run captcha captcha.solve --payload '{"siteKey":"...","url"
 
 `plugin run` is for `command.run` and custom capabilities. Core capabilities and protocol request types use their dedicated command paths.
 
+Generic plugin commands enforce the `plugin:<name>:<capability>` action policy before execution. Confirmation-gated calls require `--confirm-interactive` in a terminal and fail closed in noninteractive use.
+
 Use `--url`, `--username-selector`, `--password-selector`, and `--submit-selector` on `auth login` to override plugin-provided metadata for the current login only.
 
 Gate plugin secret access separately from normal login automation:
