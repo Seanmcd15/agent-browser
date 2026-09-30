@@ -892,7 +892,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--user-agent <ua>` | Custom User-Agent string (or `AGENT_BROWSER_USER_AGENT` env) |
 | `--proxy <url>` | Proxy server URL with optional auth (or `AGENT_BROWSER_PROXY` env) |
 | `--proxy-bypass <hosts>` | Hosts to bypass proxy (or `AGENT_BROWSER_PROXY_BYPASS` env) |
-| `--ignore-https-errors` | Ignore HTTPS certificate errors (useful for self-signed certs) |
+| `--ignore-https-errors` | Ignore HTTPS certificate errors (useful for self-signed certs). Changing this setting on an explicit launch restarts Chrome |
 | `--allow-file-access` | Allow file:// URLs to access local files (Chromium only) |
 | `--hide-scrollbars <bool>` | Hide native scrollbars in headless Chromium screenshots, enabled by default (or `AGENT_BROWSER_HIDE_SCROLLBARS` env) |
 | `-p, --provider <name>` | Browser provider, including configured `browser.provider` plugins (or `AGENT_BROWSER_PROVIDER` env) |

@@ -746,7 +746,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_OPEN,
             "Open page",
-            "Launch the browser and optionally navigate to a URL.",
+            "Launch the browser and optionally navigate to a URL. Changes to process-scoped launch options force a clean relaunch.",
             json!({
                 "url": { "type": "string", "description": "URL to open. Omit to launch about:blank." },
                 "headed": { "type": "boolean", "default": false, "description": "Show the browser window." }
@@ -3966,6 +3966,9 @@ mod tests {
             open["inputSchema"]["properties"]["namespace"]["type"],
             "string"
         );
+        assert!(open["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("clean relaunch")));
     }
 
     #[test]
