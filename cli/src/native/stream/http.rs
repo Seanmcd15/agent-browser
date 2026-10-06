@@ -144,6 +144,12 @@ fn is_same_origin_command_request(request: &str) -> bool {
     }
 }
 
+/// Returns whether a stream-server route can create a process or relay browser
+/// commands and therefore requires loopback same-origin browser metadata.
+fn is_process_control_path(path: &str) -> bool {
+    matches!(path, "/api/sessions" | "/api/command")
+}
+
 fn command_cors_headers(request: &str) -> String {
     match request_header_value(request, "origin") {
         Some(origin) if is_same_origin_command_request(request) => format!(
@@ -188,7 +194,7 @@ pub(super) async fn handle_http_request(
     let origin = parse_origin(peeked);
 
     if method == "OPTIONS" {
-        if path == "/api/command" {
+        if is_process_control_path(path) {
             if !is_same_origin_command_request(&request) {
                 write_json_error_response_no_cors(
                     &mut stream,
@@ -215,7 +221,7 @@ pub(super) async fn handle_http_request(
     }
 
     if method == "POST" {
-        if path == "/api/command" && !is_same_origin_command_request(&request) {
+        if is_process_control_path(path) && !is_same_origin_command_request(&request) {
             write_json_error_response_no_cors(
                 &mut stream,
                 "403 Forbidden",
@@ -230,7 +236,7 @@ pub(super) async fn handle_http_request(
             && (path == "/api/chat" || path == "/api/sessions" || path == "/api/command")
         {
             let body = r#"{"error":"Request body too large"}"#;
-            let cors_headers = if path == "/api/command" {
+            let cors_headers = if is_process_control_path(path) {
                 command_cors_headers(&request)
             } else {
                 CORS_HEADERS.to_string()
@@ -257,8 +263,9 @@ pub(super) async fn handle_http_request(
                     ),
                 ),
             };
+            let cors_headers = command_cors_headers(&request);
             let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n{CORS_HEADERS}\r\n",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n{cors_headers}\r\n",
                 resp_body.len()
             );
             let _ = stream.write_all(response.as_bytes()).await;
@@ -619,6 +626,52 @@ mod tests {
         assert!(
             !response.contains("Access-Control-Allow-Origin: *"),
             "forbidden command response exposed wildcard CORS: {response}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_session_spawn_is_rejected_without_cors() {
+        let body = r#"{"session":"attacker"}"#;
+        let request = format!(
+            "POST /api/sessions HTTP/1.1\r\nHost: localhost:7777\r\nOrigin: https://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response = send_request_to_handler(&request, "x").await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            !response.contains("Access-Control-Allow-Origin"),
+            "forbidden session response exposed CORS: {response}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_origin_session_spawn_reaches_handler_without_wildcard_cors() {
+        let body = "{}";
+        let request = format!(
+            "POST /api/sessions HTTP/1.1\r\nHost: localhost:7777\r\nOrigin: http://localhost:7777\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response = send_request_to_handler(&request, "x").await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "same-origin request did not reach session handler: {response}"
+        );
+        assert!(
+            response.contains("Access-Control-Allow-Origin: http://localhost:7777"),
+            "same-origin session response did not reflect origin: {response}"
+        );
+        assert!(
+            !response.contains("Access-Control-Allow-Origin: *"),
+            "same-origin session response exposed wildcard CORS: {response}"
         );
     }
 

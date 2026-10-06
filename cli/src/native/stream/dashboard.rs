@@ -134,9 +134,11 @@ fn normalize_origin_authority(origin: &str) -> Option<String> {
     } else {
         host
     };
+    let default_port = (url.scheme() == "http" && url.port() == Some(80))
+        || (url.scheme() == "https" && url.port() == Some(443));
     Some(match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host,
+        Some(port) if !default_port => format!("{host}:{port}"),
+        _ => host,
     })
 }
 
@@ -167,17 +169,47 @@ fn normalize_host_authority(host: &str) -> String {
     host
 }
 
-fn header_matches_host(request: &str, header_name: &str) -> Option<bool> {
-    let authority =
-        request_header_value(request, header_name).and_then(normalize_origin_authority)?;
-    let host = request_header_value(request, "host").map(normalize_host_authority)?;
-    Some(authority == host)
+fn authority_host(authority: &str) -> &str {
+    if let Some(stripped) = authority.strip_prefix('[') {
+        if let Some(bracket_end) = stripped.find(']') {
+            return &authority[..=bracket_end + 1];
+        }
+    }
+
+    if let Some((host, _port)) = authority.rsplit_once(':') {
+        if !host.contains(':') {
+            return host;
+        }
+    }
+
+    authority
 }
 
-/// Validates that a proxied WebSocket request either has no Origin header or
-/// presents an Origin whose authority matches the request Host header.
+fn is_loopback_authority(authority: &str) -> bool {
+    matches!(
+        authority_host(authority),
+        "localhost" | "127.0.0.1" | "::1" | "[::1]"
+    )
+}
+
+/// Matches browser origin metadata to the request host while preventing HTTP
+/// DNS rebinding. Non-loopback reverse proxies must terminate HTTPS.
+fn trusted_header_matches_host(request: &str, header_name: &str) -> Option<bool> {
+    let header = request_header_value(request, header_name)?;
+    let url = url::Url::parse(header).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Some(false);
+    }
+
+    let authority = normalize_origin_authority(header)?;
+    let host = request_header_value(request, "host").map(normalize_host_authority)?;
+    Some(authority == host && (url.scheme() == "https" || is_loopback_authority(&authority)))
+}
+
+/// Validates that a proxied WebSocket request either has no browser Origin or
+/// presents a trusted Origin whose authority matches the request Host header.
 fn is_same_origin_ws_request(request: &str) -> bool {
-    match header_matches_host(request, "origin") {
+    match trusted_header_matches_host(request, "origin") {
         Some(matches) => matches,
         None => request_header_value(request, "origin").is_none(),
     }
@@ -185,12 +217,21 @@ fn is_same_origin_ws_request(request: &str) -> bool {
 
 /// Validates that an HTTP session-proxy request came from a same-origin page.
 ///
-/// For GET requests we require either a same-origin `Origin` or a same-origin
-/// `Referer` so browsers cannot hit the proxy routes via side-channel tags or
-/// arbitrary cross-origin fetches.
+/// For GET requests we require either a trusted same-origin `Origin` or
+/// `Referer` so browsers cannot hit proxy routes via side-channel tags,
+/// cross-origin fetches, or HTTP DNS rebinding.
 fn is_same_origin_http_request(request: &str) -> bool {
-    matches!(header_matches_host(request, "origin"), Some(true))
-        || matches!(header_matches_host(request, "referer"), Some(true))
+    if request_header_value(request, "origin").is_some() {
+        matches!(trusted_header_matches_host(request, "origin"), Some(true))
+    } else {
+        matches!(trusted_header_matches_host(request, "referer"), Some(true))
+    }
+}
+
+/// Returns whether a dashboard route can create processes, execute CLI
+/// commands, or terminate sessions and therefore requires same-origin checks.
+fn is_dashboard_control_path(path: &str) -> bool {
+    matches!(path, "/api/sessions" | "/api/exec" | "/api/kill")
 }
 
 /// Parse a dashboard route of the form `/api/session/<port>/<endpoint>`.
@@ -520,6 +561,22 @@ async fn handle_dashboard_connection(mut stream: tokio::net::TcpStream) {
     let (method, path) = parse_request_method_and_path(&request);
     let origin = request_header_value(&request, "origin").map(|value| value.to_string());
 
+    if method == "OPTIONS" && is_dashboard_control_path(path) {
+        if !is_same_origin_http_request(&request) {
+            write_json_error_response_no_cors(
+                &mut stream,
+                "403 Forbidden",
+                "Origin or Referer does not match Host header.",
+            )
+            .await;
+            return;
+        }
+
+        let response = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(response.as_bytes()).await;
+        return;
+    }
+
     if method == "OPTIONS" {
         let response = format!(
             "HTTP/1.1 204 No Content\r\n{CORS_HEADERS}Access-Control-Max-Age: 86400\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -539,7 +596,17 @@ async fn handle_dashboard_connection(mut stream: tokio::net::TcpStream) {
         return;
     }
 
-    if method == "POST" && (path == "/api/sessions" || path == "/api/exec" || path == "/api/kill") {
+    if method == "POST" && is_dashboard_control_path(path) {
+        if !is_same_origin_http_request(&request) {
+            write_json_error_response_no_cors(
+                &mut stream,
+                "403 Forbidden",
+                "Origin or Referer does not match Host header.",
+            )
+            .await;
+            return;
+        }
+
         let body_str = read_post_body(&mut stream, &buf, n).await;
         let result = if path == "/api/exec" {
             exec_cli(&body_str).await
@@ -552,7 +619,7 @@ async fn handle_dashboard_connection(mut stream: tokio::net::TcpStream) {
             Ok(msg) => ("200 OK", msg),
             Err(e) => ("400 Bad Request", build_json_error_body(&e)),
         };
-        write_http_response(
+        write_http_response_no_cors(
             &mut stream,
             status,
             "application/json; charset=utf-8",
@@ -807,6 +874,26 @@ pub(super) async fn spawn_session(body: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    async fn send_request_to_dashboard_handler(request: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_dashboard_connection(stream).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server.await.unwrap();
+
+        String::from_utf8(response).unwrap()
+    }
+
     #[test]
     fn test_same_origin_ws_request_matching() {
         let req = "GET /api/session/9222/stream HTTP/1.1\r\nHost: localhost:4848\r\nOrigin: http://localhost:4848\r\nUpgrade: websocket\r\n\r\n";
@@ -817,6 +904,12 @@ mod tests {
     fn test_same_origin_ws_request_proxied() {
         let req = "GET /api/session/9222/stream HTTP/1.1\r\nHost: dashboard.agent-browser.localhost\r\nOrigin: https://dashboard.agent-browser.localhost\r\nUpgrade: websocket\r\n\r\n";
         assert!(is_same_origin_ws_request(req));
+    }
+
+    #[test]
+    fn test_same_origin_ws_request_rejects_http_dns_rebinding() {
+        let req = "GET /api/session/9222/stream HTTP/1.1\r\nHost: attacker.example:4848\r\nOrigin: http://attacker.example:4848\r\nUpgrade: websocket\r\n\r\n";
+        assert!(!is_same_origin_ws_request(req));
     }
 
     #[test]
@@ -855,6 +948,136 @@ mod tests {
     fn test_same_origin_http_request_rejects_cross_origin_referer() {
         let req = "GET /api/session/9222/tabs HTTP/1.1\r\nHost: localhost:4848\r\nReferer: https://evil.com/path\r\n\r\n";
         assert!(!is_same_origin_http_request(req));
+    }
+
+    #[test]
+    fn test_same_origin_http_request_does_not_fall_back_after_cross_origin_origin() {
+        let req = "POST /api/exec HTTP/1.1\r\nHost: localhost:4848\r\nOrigin: https://evil.com\r\nReferer: http://localhost:4848/\r\n\r\n";
+        assert!(!is_same_origin_http_request(req));
+    }
+
+    #[test]
+    fn test_same_origin_http_request_rejects_http_dns_rebinding() {
+        let req = "POST /api/exec HTTP/1.1\r\nHost: attacker.example:4848\r\nOrigin: http://attacker.example:4848\r\n\r\n";
+        assert!(!is_same_origin_http_request(req));
+    }
+
+    #[test]
+    fn test_same_origin_http_request_allows_https_reverse_proxy() {
+        let req = "POST /api/exec HTTP/1.1\r\nHost: dashboard.example:443\r\nOrigin: https://dashboard.example\r\n\r\n";
+        assert!(is_same_origin_http_request(req));
+    }
+
+    #[test]
+    fn test_dashboard_control_paths() {
+        assert!(is_dashboard_control_path("/api/sessions"));
+        assert!(is_dashboard_control_path("/api/exec"));
+        assert!(is_dashboard_control_path("/api/kill"));
+        assert!(!is_dashboard_control_path("/api/chat"));
+        assert!(!is_dashboard_control_path("/api/session/9222/tabs"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_dashboard_exec_is_rejected_without_cors() {
+        let body = r#"{"args":["cookies","get"]}"#;
+        let request = format!(
+            "POST /api/exec HTTP/1.1\r\nHost: localhost:4848\r\nOrigin: https://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response = send_request_to_dashboard_handler(&request).await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            !response.contains("Access-Control-Allow-Origin"),
+            "forbidden response exposed CORS: {response}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dashboard_exec_with_dns_rebinding_host_is_rejected() {
+        let body = r#"{"args":["cookies","get"]}"#;
+        let request = format!(
+            "POST /api/exec HTTP/1.1\r\nHost: attacker.example:4848\r\nOrigin: http://attacker.example:4848\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response = send_request_to_dashboard_handler(&request).await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            !response.contains("Access-Control-Allow-Origin"),
+            "DNS-rebinding response exposed CORS: {response}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_dashboard_exec_preflight_is_rejected_without_cors() {
+        let request = concat!(
+            "OPTIONS /api/exec HTTP/1.1\r\n",
+            "Host: localhost:4848\r\n",
+            "Origin: https://evil.example\r\n",
+            "Access-Control-Request-Method: POST\r\n",
+            "Access-Control-Request-Headers: content-type\r\n",
+            "\r\n"
+        );
+
+        let response = send_request_to_dashboard_handler(request).await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            !response.contains("Access-Control-Allow-Origin"),
+            "forbidden preflight exposed CORS: {response}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dashboard_exec_without_origin_or_referer_is_rejected() {
+        let body = r#"{"args":["cookies","get"]}"#;
+        let request = format!(
+            "POST /api/exec HTTP/1.1\r\nHost: localhost:4848\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response = send_request_to_dashboard_handler(&request).await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "unexpected response: {response}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_origin_dashboard_exec_reaches_handler_without_cors() {
+        let body = "{}";
+        let request = format!(
+            "POST /api/exec HTTP/1.1\r\nHost: localhost:4848\r\nOrigin: http://localhost:4848\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response = send_request_to_dashboard_handler(&request).await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "same-origin request did not reach exec handler: {response}"
+        );
+        assert!(
+            !response.contains("Access-Control-Allow-Origin"),
+            "same-origin control response should not expose CORS: {response}"
+        );
     }
 
     #[test]
