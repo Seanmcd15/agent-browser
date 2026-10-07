@@ -16,9 +16,9 @@
 /// to call `hook.inject()` is react-dom. In Turbopack RSC apps (e.g. Next.js
 /// 16.3+) the `react-server-dom-*` Flight client registers first as id 1 with
 /// zero fiber roots, so `get(1)` read an empty tree and every `react` command
-/// silently reported nothing. Instead, pick the first non-Flight renderer that
-/// has mounted fiber roots, falling back to any renderer with roots, then any
-/// renderer at all.
+/// silently reported nothing. Instead, prefer ReactDOM with mounted fiber
+/// roots, falling back to another non-Flight renderer with roots, any renderer
+/// with roots, then any renderer at all.
 pub const PICK_REACT_RENDERER: &str = r#"
   function __abPickReactRendererId(hook) {
     const ris = hook && hook.rendererInterfaces;
@@ -26,20 +26,31 @@ pub const PICK_REACT_RENDERER: &str = r#"
     const rootsOf = (id) => {
       try { return hook.getFiberRoots ? hook.getFiberRoots(id).size : 0; } catch (e) { return 0; }
     };
-    const isFlight = (id) => {
+    const packageNameOf = (id) => {
       const r = hook.renderers && hook.renderers.get && hook.renderers.get(id);
-      return /react-server-dom/.test((r && r.rendererPackageName) || "");
+      return (r && r.rendererPackageName) || "";
     };
-    let firstWithRoots = null, firstAny = null;
+    const isFlight = (id) => {
+      return /react-server-dom/.test(packageNameOf(id));
+    };
+    const isReactDOM = (id) => {
+      return /^react-dom(?:$|\/)/.test(packageNameOf(id));
+    };
+    let firstNonFlightWithRoots = null, firstWithRoots = null, firstAny = null;
     for (const id of ris.keys()) {
       if (!ris.get(id)) continue;
       if (firstAny === null) firstAny = id;
       if (rootsOf(id) > 0) {
         if (firstWithRoots === null) firstWithRoots = id;
-        if (!isFlight(id)) return id;
+        if (!isFlight(id)) {
+          if (firstNonFlightWithRoots === null) firstNonFlightWithRoots = id;
+          if (isReactDOM(id)) return id;
+        }
       }
     }
-    return firstWithRoots !== null ? firstWithRoots : firstAny;
+    return firstNonFlightWithRoots !== null
+      ? firstNonFlightWithRoots
+      : firstWithRoots !== null ? firstWithRoots : firstAny;
   }
 "#;
 
@@ -58,7 +69,7 @@ pub const TREE_SNAPSHOT: &str = r#"
     const out = [];
     const origEmit = hook.emit;
     hook.emit = function (event, payload) {
-      if (event === "operations") out.push(Array.from(payload));
+      if (event === "operations" && payload[0] === __abRiId) out.push(Array.from(payload));
       return origEmit.apply(hook, arguments);
     };
     ri.flushInitialOperations();
@@ -479,7 +490,7 @@ pub const SUSPENSE_WALK: &str = r#"
     const out = [];
     const origEmit = hook.emit;
     hook.emit = function (event, payload) {
-      if (event === "operations") out.push(payload);
+      if (event === "operations" && payload[0] === __abRiId) out.push(payload);
       return origEmit.apply(this, arguments);
     };
     ri.flushInitialOperations();
@@ -838,5 +849,22 @@ mod tests {
         assert!(PICK_REACT_RENDERER.contains("getFiberRoots"));
         assert!(PICK_REACT_RENDERER.contains("firstWithRoots"));
         assert!(PICK_REACT_RENDERER.contains("firstAny"));
+    }
+
+    /// Pages can mount multiple non-Flight renderers. Prefer ReactDOM even
+    /// when an earlier custom renderer, such as react-three-fiber, has roots.
+    #[test]
+    fn picker_prefers_react_dom_over_custom_renderers() {
+        assert!(PICK_REACT_RENDERER.contains("react-dom"));
+        assert!(PICK_REACT_RENDERER.contains("firstNonFlightWithRoots"));
+    }
+
+    /// The DevTools hook is shared by every renderer on the page. Tree walks
+    /// must ignore operation packets from renderers other than the selected one.
+    #[test]
+    fn tree_scripts_filter_operations_by_renderer() {
+        for script in [TREE_SNAPSHOT, SUSPENSE_WALK] {
+            assert!(script.contains("payload[0] === __abRiId"));
+        }
     }
 }
