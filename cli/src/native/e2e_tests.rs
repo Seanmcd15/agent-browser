@@ -5667,6 +5667,60 @@ async fn e2e_restore_validation_failure_does_not_overwrite_state() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_restore_validation_retries_after_early_failure() {
+    let restore_key = format!(
+        "e2e-restore-retry-{}",
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    create_restore_state_with_cookie(&restore_key, "restore_retry_test", "known_good").await;
+
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({
+            "id": "10",
+            "action": "launch",
+            "restoreKey": restore_key,
+            "restoreCheckText": "Dashboard"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(state.restore_validation_pending);
+
+    let resp = execute_command(&json!({ "id": "11", "action": "session_info" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["lifecycle"]["restoreStatus"],
+        "loaded_but_invalid"
+    );
+    assert!(
+        state.restore_validation_pending,
+        "an early validation failure must remain retryable"
+    );
+
+    let resp = execute_command(
+        &json!({
+            "id": "12",
+            "action": "navigate",
+            "url": "data:text/html,<h1>Dashboard</h1>"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["lifecycle"]["restoreStatus"], "loaded");
+    assert!(!state.restore_validation_pending);
+
+    let resp = execute_command(&json!({ "id": "13", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["saveStatus"], "saved");
+
+    cleanup_restore_state_files(&restore_key);
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_restore_key_switch_reloads_instead_of_reusing_live_browser() {
     let restore_key_a = format!(
         "e2e-restore-switch-a-{}",
