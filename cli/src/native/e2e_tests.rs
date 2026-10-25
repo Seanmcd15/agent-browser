@@ -5650,7 +5650,19 @@ async fn e2e_restore_validation_failure_does_not_overwrite_state() {
             "loaded_but_invalid"
         );
 
-        let resp = execute_command(&json!({ "id": "11", "action": "close" }), &mut state).await;
+        let resp = execute_command(
+            &json!({
+                "id": "11",
+                "action": "close",
+                "restoreKey": restore_key,
+                "restoreSave": "auto",
+                "restoreCheckUrl": null,
+                "restoreCheckText": null,
+                "restoreCheckFn": null
+            }),
+            &mut state,
+        )
+        .await;
         assert_success(&resp);
         assert_eq!(get_data(&resp)["saveStatus"], "skipped_restore_failed");
     }
