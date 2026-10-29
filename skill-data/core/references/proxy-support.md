@@ -1,6 +1,6 @@
 # Proxy Support
 
-Proxy configuration for geo-testing, rate limiting avoidance, and corporate environments.
+Proxy configuration for geo-testing, rate limiting avoidance, and corporate environments. The resolved proxy and bypass settings apply to both browser traffic and direct HTTP requests made by `read`.
 
 **Related**: [commands.md](commands.md) for global options, [SKILL.md](../SKILL.md) for quick start.
 
