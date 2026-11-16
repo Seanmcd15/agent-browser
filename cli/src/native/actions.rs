@@ -1435,8 +1435,30 @@ async fn apply_restore_config_after_confirmation(
 ) -> Result<bool, String> {
     let restore_key_changed = command_changes_restore_key(cmd, state);
     let had_browser = has_active_browser_session(state);
+    let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
     if restore_key_changed && had_browser {
+        // First-time adoption (no prior restore key): bind the live browser to the
+        // new key so in-memory cookies/storage are not discarded on relaunch.
+        if state.session_name.is_none() {
+            apply_restore_config_from_command(cmd, state)?;
+            return Ok(false);
+        }
+
+        // Named key switches tear down the browser so the next launch loads the
+        // new key's state. Skip-launch actions never relaunch, so refuse instead
+        // of silently destroying the session (e.g. `read` with a new --restore).
+        if skip_launch_action(action) {
+            return Err(format!(
+                "Cannot change restore key from '{}' to '{}' during '{}': that would close the browser without relaunching. Close the session first, or run a command that relaunches (for example open or snapshot).",
+                state.session_name.as_deref().unwrap_or(""),
+                cmd.get("restoreKey")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+                action
+            ));
+        }
+
         let _ = auto_save_restore_state(state).await;
         let _ = close_current_browser(state).await;
     }
@@ -1631,9 +1653,12 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     super::element::set_active_frame(state.active_frame_id.as_deref());
 
     let skip_launch = skip_launch_action(action);
+    // Only force relaunch when switching away from an already-bound restore key.
+    // Adopting a key for the first time (None -> Some) keeps the live browser.
     let restore_key_change_needs_launch = !skip_launch
         && command_changes_restore_key(cmd, state)
-        && has_active_browser_session(state);
+        && has_active_browser_session(state)
+        && state.session_name.is_some();
     let needs_launch = if !skip_launch {
         // Check if existing connection is stale and needs re-launch.
         // This must happen before policy evaluation so plugin capability
@@ -9484,6 +9509,82 @@ mod tests {
         assert!(!state.restore_validation_pending);
         assert_eq!(state.restore_save_status, "not_attempted");
         assert!(state.restore_saved_path.is_none());
+    }
+
+    fn mock_active_provider_session() -> ActiveProviderSession {
+        ActiveProviderSession {
+            session: providers::ProviderSession {
+                provider: "plugin:cloud-browser".to_string(),
+                session_id: r#"{"sessionId":"s1"}"#.to_string(),
+            },
+            plugins: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_key_adoption_keeps_live_browser() {
+        let mut state = DaemonState::new();
+        state.session_name = None;
+        state.active_provider_session = Some(mock_active_provider_session());
+
+        let closed = apply_restore_config_after_confirmation(
+            &json!({
+                "action": "snapshot",
+                "restoreKey": "myapp"
+            }),
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert!(!closed);
+        assert!(state.active_provider_session.is_some());
+        assert_eq!(state.session_name.as_deref(), Some("myapp"));
+    }
+
+    #[tokio::test]
+    async fn test_restore_key_change_on_read_refuses_without_teardown() {
+        let mut state = DaemonState::new();
+        state.session_name = Some("old-key".to_string());
+        state.restore_status = "loaded".to_string();
+        state.active_provider_session = Some(mock_active_provider_session());
+
+        let err = apply_restore_config_after_confirmation(
+            &json!({
+                "action": "read",
+                "url": "https://example.com/docs",
+                "restoreKey": "new-key"
+            }),
+            &mut state,
+        )
+        .await
+        .expect_err("skip-launch restore key switches must fail closed");
+
+        assert!(err.contains("Cannot change restore key"));
+        assert!(err.contains("read"));
+        assert!(state.active_provider_session.is_some());
+        assert_eq!(state.session_name.as_deref(), Some("old-key"));
+        assert_eq!(state.restore_status, "loaded");
+    }
+
+    #[tokio::test]
+    async fn test_restore_key_change_on_read_without_browser_applies_config() {
+        let mut state = DaemonState::new();
+        state.session_name = Some("old-key".to_string());
+
+        let closed = apply_restore_config_after_confirmation(
+            &json!({
+                "action": "read",
+                "url": "https://example.com/docs",
+                "restoreKey": "new-key"
+            }),
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert!(!closed);
+        assert_eq!(state.session_name.as_deref(), Some("new-key"));
     }
 
     #[test]
