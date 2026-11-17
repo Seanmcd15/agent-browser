@@ -934,7 +934,7 @@ agent-browser open example.com
 agent-browser dashboard stop
 ```
 
-The dashboard runs as a standalone background process on port 4848, independent of browser sessions. It stays available even when no sessions are running, and it works from `http://localhost:4848` or a proxied/forwarded URL that reaches the dashboard server, such as `https://dashboard.agent-browser.localhost` or a Coder workspace URL. The browser stays on the dashboard origin; session-specific tabs, status, and stream traffic are proxied internally, so session ports do not need to be exposed.
+The dashboard runs as a standalone background process on port 4848, independent of browser sessions. It stays available even when no sessions are running, and it works from `http://localhost:4848` or a proxied/forwarded URL that reaches the dashboard server, such as `https://dashboard.agent-browser.localhost`. Sensitive dashboard and stream API routes require same-origin `Origin`/`Referer` against an allowlisted `Host` (loopback, `*.localhost`, or hosts in `AGENT_BROWSER_DASHBOARD_ALLOWED_HOSTS`). For Coder or other reverse-proxy hostnames, set that variable before starting the dashboard. The browser stays on the dashboard origin; session-specific tabs, status, and stream traffic are proxied internally, so session ports do not need to be exposed.
 
 The dashboard displays:
 - **Live viewport**: real-time JPEG frames from the browser

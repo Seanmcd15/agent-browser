@@ -19,6 +19,9 @@ struct DashboardAssets;
 
 pub(super) const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n";
 
+const DASHBOARD_ALLOWED_HOSTS_ENV: &str = "AGENT_BROWSER_DASHBOARD_ALLOWED_HOSTS";
+const SAME_ORIGIN_FORBIDDEN: &str = "Origin or Referer does not match an allowed Host.";
+
 /// Build CORS headers that reflect the request origin only when it passes
 /// `is_allowed_origin`. Used for sensitive endpoints (chat, models) so the
 /// API key is not accessible from arbitrary web pages.
@@ -123,31 +126,75 @@ fn is_loopback_authority(authority: &str) -> bool {
     )
 }
 
-fn header_authority_matches_host(request: &str, header_name: &str) -> bool {
-    let Some(authority) =
-        request_header_value(request, header_name).and_then(normalize_origin_authority)
-    else {
-        return false;
-    };
-    let Some(host) = request_header_value(request, "host").map(normalize_host_authority) else {
-        return false;
-    };
-    authority == host && is_loopback_authority(&authority) && is_loopback_authority(&host)
-}
-
-/// Protects the command relay by requiring same-origin browser metadata.
-fn is_same_origin_command_request(request: &str) -> bool {
-    if request_header_value(request, "origin").is_some() {
-        header_authority_matches_host(request, "origin")
-    } else {
-        header_authority_matches_host(request, "referer")
+/// Hostnames that may front stream/dashboard HTTP without being loopback literals.
+///
+/// `*.localhost` is included because RFC 6761 resolves it to loopback. Other
+/// reverse-proxy hosts (Coder, custom domains) must be listed in
+/// `AGENT_BROWSER_DASHBOARD_ALLOWED_HOSTS`.
+fn is_allowed_dashboard_host(host_authority: &str) -> bool {
+    if is_loopback_authority(host_authority) {
+        return true;
     }
+
+    let host = authority_host(host_authority);
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+
+    let Ok(list) = std::env::var(DASHBOARD_ALLOWED_HOSTS_ENV) else {
+        return false;
+    };
+    for entry in list.split(',') {
+        let entry = entry.trim().to_ascii_lowercase();
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some(suffix) = entry.strip_prefix("*.") {
+            if host == suffix || host.ends_with(&format!(".{suffix}")) {
+                return true;
+            }
+        } else if host == entry {
+            return true;
+        }
+    }
+    false
 }
 
-fn command_cors_headers(request: &str) -> String {
+fn header_matches_host(request: &str, header_name: &str) -> Option<bool> {
+    let authority =
+        request_header_value(request, header_name).and_then(normalize_origin_authority)?;
+    let host = request_header_value(request, "host").map(normalize_host_authority)?;
+    Some(authority == host)
+}
+
+fn request_host_is_allowed(request: &str) -> bool {
+    request_header_value(request, "host")
+        .map(normalize_host_authority)
+        .is_some_and(|host| is_allowed_dashboard_host(&host))
+}
+
+/// Protects mutating and sensitive stream APIs by requiring same-origin browser
+/// metadata against an allowlisted Host (loopback, `*.localhost`, or
+/// `AGENT_BROWSER_DASHBOARD_ALLOWED_HOSTS`).
+fn is_same_origin_sensitive_request(request: &str) -> bool {
+    if !request_host_is_allowed(request) {
+        return false;
+    }
+    matches!(header_matches_host(request, "origin"), Some(true))
+        || matches!(header_matches_host(request, "referer"), Some(true))
+}
+
+fn is_sensitive_stream_api(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/command" | "/api/chat" | "/api/sessions" | "/api/models" | "/api/chat/status"
+    )
+}
+
+fn sensitive_cors_headers(request: &str) -> String {
     match request_header_value(request, "origin") {
-        Some(origin) if is_same_origin_command_request(request) => format!(
-            "Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nVary: Origin\r\n"
+        Some(origin) if is_same_origin_sensitive_request(request) => format!(
+            "Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nVary: Origin\r\n"
         ),
         _ => String::new(),
     }
@@ -188,18 +235,18 @@ pub(super) async fn handle_http_request(
     let origin = parse_origin(peeked);
 
     if method == "OPTIONS" {
-        if path == "/api/command" {
-            if !is_same_origin_command_request(&request) {
+        if is_sensitive_stream_api(path) {
+            if !is_same_origin_sensitive_request(&request) {
                 write_json_error_response_no_cors(
                     &mut stream,
                     "403 Forbidden",
-                    "Origin or Referer does not match Host header.",
+                    SAME_ORIGIN_FORBIDDEN,
                 )
                 .await;
                 return;
             }
 
-            let cors_headers = command_cors_headers(&request);
+            let cors_headers = sensitive_cors_headers(&request);
             let response = format!(
                 "HTTP/1.1 204 No Content\r\n{cors_headers}Access-Control-Max-Age: 86400\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
@@ -215,13 +262,9 @@ pub(super) async fn handle_http_request(
     }
 
     if method == "POST" {
-        if path == "/api/command" && !is_same_origin_command_request(&request) {
-            write_json_error_response_no_cors(
-                &mut stream,
-                "403 Forbidden",
-                "Origin or Referer does not match Host header.",
-            )
-            .await;
+        if is_sensitive_stream_api(path) && !is_same_origin_sensitive_request(&request) {
+            write_json_error_response_no_cors(&mut stream, "403 Forbidden", SAME_ORIGIN_FORBIDDEN)
+                .await;
             return;
         }
 
@@ -230,11 +273,7 @@ pub(super) async fn handle_http_request(
             && (path == "/api/chat" || path == "/api/sessions" || path == "/api/command")
         {
             let body = r#"{"error":"Request body too large"}"#;
-            let cors_headers = if path == "/api/command" {
-                command_cors_headers(&request)
-            } else {
-                CORS_HEADERS.to_string()
-            };
+            let cors_headers = sensitive_cors_headers(&request);
             let response = format!(
                 "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{cors_headers}\r\n",
                 body.len()
@@ -257,8 +296,9 @@ pub(super) async fn handle_http_request(
                     ),
                 ),
             };
+            let cors_headers = sensitive_cors_headers(&request);
             let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n{CORS_HEADERS}\r\n",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n{cors_headers}\r\n",
                 resp_body.len()
             );
             let _ = stream.write_all(response.as_bytes()).await;
@@ -278,7 +318,7 @@ pub(super) async fn handle_http_request(
                     ),
                 ),
             };
-            let cors_headers = command_cors_headers(&request);
+            let cors_headers = sensitive_cors_headers(&request);
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n{cors_headers}\r\n",
                 resp_body.len()
@@ -295,17 +335,37 @@ pub(super) async fn handle_http_request(
     }
 
     if method == "GET" && path == "/api/models" {
+        if !is_same_origin_sensitive_request(&request) {
+            write_json_error_response_no_cors(&mut stream, "403 Forbidden", SAME_ORIGIN_FORBIDDEN)
+                .await;
+            return;
+        }
         handle_models_request(&mut stream, origin.as_deref()).await;
         return;
     }
 
-    let (status, content_type, body): (&str, &str, Vec<u8>) = if path == "/api/sessions" {
-        (
-            "200 OK",
-            "application/json; charset=utf-8",
-            discover_sessions().into_bytes(),
-        )
-    } else if path == "/api/tabs" {
+    if path == "/api/sessions" || path == "/api/chat/status" {
+        if !is_same_origin_sensitive_request(&request) {
+            write_json_error_response_no_cors(&mut stream, "403 Forbidden", SAME_ORIGIN_FORBIDDEN)
+                .await;
+            return;
+        }
+        let body = if path == "/api/sessions" {
+            discover_sessions().into_bytes()
+        } else {
+            chat_status_json().into_bytes()
+        };
+        let cors_headers = sensitive_cors_headers(&request);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n{cors_headers}\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(&body).await;
+        return;
+    }
+
+    let (status, content_type, body): (&str, &str, Vec<u8>) = if path == "/api/tabs" {
         let tabs = last_tabs.read().await;
         (
             "200 OK",
@@ -320,12 +380,6 @@ pub(super) async fn handle_http_request(
             "200 OK",
             "application/json; charset=utf-8",
             format!(r#"{{"engine":"{}"}}"#, *engine).into_bytes(),
-        )
-    } else if path == "/api/chat/status" {
-        (
-            "200 OK",
-            "application/json; charset=utf-8",
-            chat_status_json().into_bytes(),
         )
     } else {
         serve_embedded_file(path)
@@ -640,6 +694,56 @@ mod tests {
         assert!(
             !response.contains("Access-Control-Allow-Origin: *"),
             "forbidden command response exposed wildcard CORS: {response}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_chat_post_is_rejected_without_wildcard_cors() {
+        let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let request = format!(
+            "POST /api/chat HTTP/1.1\r\nHost: localhost:7777\r\nOrigin: https://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response = send_request_to_handler(&request, "x").await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            !response.contains("Access-Control-Allow-Origin: *"),
+            "forbidden chat response exposed wildcard CORS: {response}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_get_without_origin_is_rejected() {
+        let request = "GET /api/sessions HTTP/1.1\r\nHost: localhost:7777\r\n\r\n";
+        let response = send_request_to_handler(request, "x").await;
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "unexpected response: {response}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_get_same_origin_succeeds_without_wildcard_cors() {
+        let request =
+            "GET /api/sessions HTTP/1.1\r\nHost: localhost:7777\r\nOrigin: http://localhost:7777\r\n\r\n";
+        let response = send_request_to_handler(request, "x").await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            response.contains("Access-Control-Allow-Origin: http://localhost:7777"),
+            "same-origin sessions response did not reflect origin: {response}"
+        );
+        assert!(
+            !response.contains("Access-Control-Allow-Origin: *"),
+            "same-origin sessions response exposed wildcard CORS: {response}"
         );
     }
 
