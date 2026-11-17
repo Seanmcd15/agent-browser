@@ -7,9 +7,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
+
+use crate::native::policy::{ActionPolicy, PolicyResult};
 
 pub const PROTOCOL_VERSION: &str = "agent-browser.plugin.v1";
 pub const TYPE_PLUGIN_MANIFEST: &str = "plugin.manifest";
@@ -777,7 +780,14 @@ fn add_plugin_command(args: &[String], json_output: bool) -> Result<(), String> 
     Ok(())
 }
 
-pub fn run_plugin_command(args: &[String], plugins: &[PluginConfig], json_output: bool) {
+pub fn run_plugin_command(
+    args: &[String],
+    plugins: &[PluginConfig],
+    json_output: bool,
+    action_policy_path: Option<&str>,
+    confirm_actions: Option<&str>,
+    confirm_interactive: bool,
+) {
     let sub = args.get(1).map(|s| s.as_str()).unwrap_or("list");
     match sub {
         "list" => print_plugin_list(plugins, json_output),
@@ -838,6 +848,16 @@ pub fn run_plugin_command(args: &[String], plugins: &[PluginConfig], json_output
             } else {
                 CAPABILITY_COMMAND_RUN
             };
+            if let Err(e) = enforce_plugin_run_policy(
+                name,
+                capability,
+                action_policy_path,
+                confirm_actions,
+                confirm_interactive,
+            ) {
+                print_plugin_error(&e, json_output);
+                std::process::exit(1);
+            }
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             match rt.block_on(invoke_plugin(
                 plugin,
@@ -864,6 +884,61 @@ pub fn run_plugin_command(args: &[String], plugins: &[PluginConfig], json_output
             );
             std::process::exit(1);
         }
+    }
+}
+
+/// Enforce capability-scoped policy before a standalone plugin process starts.
+///
+/// Standalone commands cannot store a pending daemon confirmation, so they
+/// require an interactive terminal for confirmation-gated actions.
+fn enforce_plugin_run_policy(
+    plugin_name: &str,
+    capability: &str,
+    action_policy_path: Option<&str>,
+    confirm_actions: Option<&str>,
+    confirm_interactive: bool,
+) -> Result<(), String> {
+    let action = plugin_policy_action(plugin_name, capability);
+    let mut requires_confirmation = false;
+
+    if let Some(path) = action_policy_path {
+        match ActionPolicy::load(path)?.check(&action) {
+            PolicyResult::Allow => {}
+            PolicyResult::Deny(reason) => return Err(reason),
+            PolicyResult::RequiresConfirmation => requires_confirmation = true,
+        }
+    }
+
+    if confirm_actions.is_some_and(|categories| {
+        categories
+            .split(',')
+            .map(|category| category.trim().to_lowercase())
+            .any(|category| category == action)
+    }) {
+        requires_confirmation = true;
+    }
+
+    if !requires_confirmation {
+        return Ok(());
+    }
+    if !confirm_interactive || !std::io::stdin().is_terminal() {
+        return Err(format!(
+            "Action '{}' requires confirmation; rerun with --confirm-interactive in a terminal",
+            action
+        ));
+    }
+
+    eprintln!("[agent-browser] Action requires confirmation:");
+    eprintln!("  {}", action);
+    eprint!("  Allow? [y/N]: ");
+    let _ = std::io::stderr().flush();
+    let mut input = String::new();
+    let approved = std::io::stdin().read_line(&mut input).is_ok()
+        && matches!(input.trim().to_lowercase().as_str(), "y" | "yes");
+    if approved {
+        Ok(())
+    } else {
+        Err(format!("Action '{}' denied", action))
     }
 }
 

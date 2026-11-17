@@ -185,8 +185,7 @@ struct DrainedEvents {
 /// Compute a hash of the [`LaunchOptions`] fields that require a browser
 /// relaunch when changed (baked into the Chrome process at startup).
 ///
-/// Fields NOT hashed:
-/// ignore_https_errors, color_scheme, download_path
+/// Fields NOT hashed: color_scheme, download_path
 ///
 /// `storage_state` is handled separately in `handle_launch()`: explicit
 /// `storageState` launches always require a clean local browser so the loaded
@@ -218,6 +217,7 @@ fn launch_hash(
     opts.proxy_password.hash(&mut h);
     opts.user_agent.hash(&mut h);
     opts.allow_file_access.hash(&mut h);
+    opts.ignore_https_errors.hash(&mut h);
     opts.hide_scrollbars.hash(&mut h);
     enable_features.hash(&mut h);
     init_script_paths.hash(&mut h);
@@ -10537,6 +10537,18 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
                 "provider",
                 Some("kernel")
             )
+        );
+    }
+
+    #[test]
+    fn test_launch_hash_includes_ignore_https_errors() {
+        let verified = LaunchOptions::default();
+        let mut ignored = LaunchOptions::default();
+        ignored.ignore_https_errors = true;
+
+        assert_ne!(
+            launch_hash(&verified, &[], &[], &[], Some("chrome"), "local", None),
+            launch_hash(&ignored, &[], &[], &[], Some("chrome"), "local", None)
         );
     }
 
