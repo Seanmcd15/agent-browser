@@ -2450,18 +2450,21 @@ async fn validate_restore_if_pending(state: &mut DaemonState) {
     if !state.restore_validation_pending {
         return;
     }
-    state.restore_validation_pending = false;
 
     match validate_restored_state(state).await {
         Ok(()) => {
             state.restore_status = "loaded".to_string();
             state.restore_status_detail = None;
             state.restore_load_failed = false;
+            state.restore_validation_pending = false;
         }
         Err(err) => {
             state.restore_status = "loaded_but_invalid".to_string();
             state.restore_status_detail = Some(err);
             state.restore_load_failed = true;
+            // Keep retrying after subsequent successful actions. Validation may
+            // run before the browser reaches the expected post-restore page.
+            state.restore_validation_pending = true;
         }
     }
 }
