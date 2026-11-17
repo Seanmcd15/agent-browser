@@ -15,6 +15,13 @@ Then open `http://localhost:4848` or a proxied/forwarded dashboard URL such as `
 
 All sessions automatically stream to the dashboard. No extra flags are needed. The browser stays on the dashboard origin while the server proxies per-session tabs, status, and stream traffic internally, so session ports do not need to be exposed.
 
+Sensitive routes (`/api/exec`, `/api/kill`, `/api/sessions`, `/api/chat`, session proxy, and related APIs) require same-origin `Origin` or `Referer` against an allowlisted `Host`. Loopback and `*.localhost` are always allowed. For other reverse-proxy hostnames, set `AGENT_BROWSER_DASHBOARD_ALLOWED_HOSTS` before starting the dashboard:
+
+```bash
+export AGENT_BROWSER_DASHBOARD_ALLOWED_HOSTS=workspace.coder.com,*.my-tunnel.example
+agent-browser dashboard start
+```
+
 ### Custom stream port
 
 By default each session binds its WebSocket stream server to an OS-assigned port. To use a specific port, set the `AGENT_BROWSER_STREAM_PORT` environment variable:

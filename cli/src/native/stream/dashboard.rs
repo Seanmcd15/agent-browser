@@ -5,6 +5,7 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::connection::get_socket_dir;
+use crate::validation::{is_valid_session_name, session_name_error};
 
 use super::chat::{chat_status_json, handle_chat_request, handle_models_request};
 use super::discovery::discover_sessions;
@@ -42,6 +43,10 @@ impl DashboardProxyError {
 
 const PROXY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const PROXY_MAX_RESPONSE_SIZE: u64 = 16 * 1024 * 1024;
+/// Match the stream HTTP body cap so unauthenticated POSTs cannot force huge allocations.
+const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+const DASHBOARD_ALLOWED_HOSTS_ENV: &str = "AGENT_BROWSER_DASHBOARD_ALLOWED_HOSTS";
+const SAME_ORIGIN_FORBIDDEN: &str = "Origin or Referer does not match an allowed Host.";
 
 fn build_json_error_body(error: &str) -> String {
     let escaped = serde_json::to_string(error).unwrap_or_else(|_| format!("\"{}\"", error));
@@ -167,6 +172,63 @@ fn normalize_host_authority(host: &str) -> String {
     host
 }
 
+fn authority_host(authority: &str) -> &str {
+    if let Some(stripped) = authority.strip_prefix('[') {
+        if let Some(bracket_end) = stripped.find(']') {
+            return &authority[..=bracket_end + 1];
+        }
+    }
+
+    if let Some((host, _port)) = authority.rsplit_once(':') {
+        if !host.contains(':') {
+            return host;
+        }
+    }
+
+    authority
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    matches!(
+        authority_host(authority),
+        "localhost" | "127.0.0.1" | "::1" | "[::1]"
+    )
+}
+
+/// Hostnames that may front the dashboard without being loopback literals.
+///
+/// `*.localhost` is included because RFC 6761 resolves it to loopback. Other
+/// reverse-proxy hosts (Coder, custom domains) must be listed in
+/// `AGENT_BROWSER_DASHBOARD_ALLOWED_HOSTS`.
+fn is_allowed_dashboard_host(host_authority: &str) -> bool {
+    if is_loopback_authority(host_authority) {
+        return true;
+    }
+
+    let host = authority_host(host_authority);
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+
+    let Ok(list) = std::env::var(DASHBOARD_ALLOWED_HOSTS_ENV) else {
+        return false;
+    };
+    for entry in list.split(',') {
+        let entry = entry.trim().to_ascii_lowercase();
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some(suffix) = entry.strip_prefix("*.") {
+            if host == suffix || host.ends_with(&format!(".{suffix}")) {
+                return true;
+            }
+        } else if host == entry {
+            return true;
+        }
+    }
+    false
+}
+
 fn header_matches_host(request: &str, header_name: &str) -> Option<bool> {
     let authority =
         request_header_value(request, header_name).and_then(normalize_origin_authority)?;
@@ -174,23 +236,48 @@ fn header_matches_host(request: &str, header_name: &str) -> Option<bool> {
     Some(authority == host)
 }
 
-/// Validates that a proxied WebSocket request either has no Origin header or
-/// presents an Origin whose authority matches the request Host header.
-fn is_same_origin_ws_request(request: &str) -> bool {
-    match header_matches_host(request, "origin") {
-        Some(matches) => matches,
-        None => request_header_value(request, "origin").is_none(),
-    }
+fn request_host_is_allowed(request: &str) -> bool {
+    request_header_value(request, "host")
+        .map(normalize_host_authority)
+        .is_some_and(|host| is_allowed_dashboard_host(&host))
 }
 
-/// Validates that an HTTP session-proxy request came from a same-origin page.
-///
-/// For GET requests we require either a same-origin `Origin` or a same-origin
-/// `Referer` so browsers cannot hit the proxy routes via side-channel tags or
-/// arbitrary cross-origin fetches.
+/// Validates that a proxied WebSocket request presents an Origin whose
+/// authority matches an allowed Host. Missing Origin is rejected so
+/// non-browser clients cannot skip CSRF metadata.
+fn is_same_origin_ws_request(request: &str) -> bool {
+    if !request_host_is_allowed(request) {
+        return false;
+    }
+    matches!(header_matches_host(request, "origin"), Some(true))
+}
+
+/// Validates that a dashboard API request came from a same-origin page on an
+/// allowed host. Requires Origin or Referer to match Host, and Host must be
+/// loopback, `*.localhost`, or listed in `AGENT_BROWSER_DASHBOARD_ALLOWED_HOSTS`.
+/// This blocks classic cross-origin CSRF and DNS rebinding to arbitrary names.
 fn is_same_origin_http_request(request: &str) -> bool {
+    if !request_host_is_allowed(request) {
+        return false;
+    }
     matches!(header_matches_host(request, "origin"), Some(true))
         || matches!(header_matches_host(request, "referer"), Some(true))
+}
+
+fn is_sensitive_dashboard_api(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/exec" | "/api/kill" | "/api/sessions" | "/api/chat" | "/api/models" | "/api/chat/status"
+    ) || path.starts_with("/api/session/")
+}
+
+fn sensitive_cors_headers(request: &str) -> String {
+    match request_header_value(request, "origin") {
+        Some(origin) if is_same_origin_http_request(request) => format!(
+            "Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nVary: Origin\r\n"
+        ),
+        _ => String::new(),
+    }
 }
 
 /// Parse a dashboard route of the form `/api/session/<port>/<endpoint>`.
@@ -484,7 +571,7 @@ async fn handle_dashboard_connection(mut stream: tokio::net::TcpStream) {
                     write_json_error_response_no_cors(
                         &mut stream,
                         "403 Forbidden",
-                        "Origin does not match Host header.",
+                        SAME_ORIGIN_FORBIDDEN,
                     )
                     .await;
                     return;
@@ -521,6 +608,20 @@ async fn handle_dashboard_connection(mut stream: tokio::net::TcpStream) {
     let origin = request_header_value(&request, "origin").map(|value| value.to_string());
 
     if method == "OPTIONS" {
+        if is_sensitive_dashboard_api(path) {
+            if !is_same_origin_http_request(&request) {
+                write_json_error_response_no_cors(&mut stream, "403 Forbidden", SAME_ORIGIN_FORBIDDEN)
+                    .await;
+                return;
+            }
+            let cors_headers = sensitive_cors_headers(&request);
+            let response = format!(
+                "HTTP/1.1 204 No Content\r\n{cors_headers}Access-Control-Max-Age: 86400\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            return;
+        }
+
         let response = format!(
             "HTTP/1.1 204 No Content\r\n{CORS_HEADERS}Access-Control-Max-Age: 86400\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
@@ -529,18 +630,49 @@ async fn handle_dashboard_connection(mut stream: tokio::net::TcpStream) {
     }
 
     if method == "POST" && path == "/api/chat" {
-        let body_str = read_post_body(&mut stream, &buf, n).await;
+        if !is_same_origin_http_request(&request) {
+            write_json_error_response_no_cors(&mut stream, "403 Forbidden", SAME_ORIGIN_FORBIDDEN)
+                .await;
+            return;
+        }
+        let Some(body_str) = read_post_body(&mut stream, &buf, n).await else {
+            write_json_error_response_no_cors(
+                &mut stream,
+                "413 Payload Too Large",
+                "Request body too large",
+            )
+            .await;
+            return;
+        };
         handle_chat_request(&mut stream, &body_str, origin.as_deref()).await;
         return;
     }
 
     if method == "GET" && path == "/api/models" {
+        if !is_same_origin_http_request(&request) {
+            write_json_error_response_no_cors(&mut stream, "403 Forbidden", SAME_ORIGIN_FORBIDDEN)
+                .await;
+            return;
+        }
         handle_models_request(&mut stream, origin.as_deref()).await;
         return;
     }
 
     if method == "POST" && (path == "/api/sessions" || path == "/api/exec" || path == "/api/kill") {
-        let body_str = read_post_body(&mut stream, &buf, n).await;
+        if !is_same_origin_http_request(&request) {
+            write_json_error_response_no_cors(&mut stream, "403 Forbidden", SAME_ORIGIN_FORBIDDEN)
+                .await;
+            return;
+        }
+        let Some(body_str) = read_post_body(&mut stream, &buf, n).await else {
+            write_json_error_response_no_cors(
+                &mut stream,
+                "413 Payload Too Large",
+                "Request body too large",
+            )
+            .await;
+            return;
+        };
         let result = if path == "/api/exec" {
             exec_cli(&body_str).await
         } else if path == "/api/kill" {
@@ -552,13 +684,13 @@ async fn handle_dashboard_connection(mut stream: tokio::net::TcpStream) {
             Ok(msg) => ("200 OK", msg),
             Err(e) => ("400 Bad Request", build_json_error_body(&e)),
         };
-        write_http_response(
-            &mut stream,
-            status,
-            "application/json; charset=utf-8",
-            resp_body.as_bytes(),
-        )
-        .await;
+        let cors_headers = sensitive_cors_headers(&request);
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n{cors_headers}\r\n",
+            resp_body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(resp_body.as_bytes()).await;
         return;
     }
 
@@ -577,7 +709,7 @@ async fn handle_dashboard_connection(mut stream: tokio::net::TcpStream) {
                     write_json_error_response_no_cors(
                         &mut stream,
                         "403 Forbidden",
-                        "Origin or Referer does not match Host header.",
+                        SAME_ORIGIN_FORBIDDEN,
                     )
                     .await;
                     return;
@@ -611,26 +743,38 @@ async fn handle_dashboard_connection(mut stream: tokio::net::TcpStream) {
         }
     }
 
-    let (status, content_type, body): (&str, &str, Vec<u8>) = if path == "/api/sessions" {
-        (
-            "200 OK",
-            "application/json; charset=utf-8",
-            discover_sessions().into_bytes(),
-        )
-    } else if path == "/api/chat/status" {
-        (
-            "200 OK",
-            "application/json; charset=utf-8",
-            chat_status_json().into_bytes(),
-        )
-    } else {
-        serve_embedded_file(path)
-    };
+    if path == "/api/sessions" || path == "/api/chat/status" {
+        if !is_same_origin_http_request(&request) {
+            write_json_error_response_no_cors(&mut stream, "403 Forbidden", SAME_ORIGIN_FORBIDDEN)
+                .await;
+            return;
+        }
+        let body = if path == "/api/sessions" {
+            discover_sessions().into_bytes()
+        } else {
+            chat_status_json().into_bytes()
+        };
+        let cors_headers = sensitive_cors_headers(&request);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n{cors_headers}\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(&body).await;
+        return;
+    }
 
+    let (status, content_type, body) = serve_embedded_file(path);
     write_http_response(&mut stream, status, content_type, &body).await;
 }
 
-async fn read_post_body(stream: &mut tokio::net::TcpStream, initial: &[u8], n: usize) -> String {
+/// Returns `None` when Content-Length exceeds [`MAX_BODY_SIZE`] so callers can
+/// answer 413 without allocating attacker-controlled buffers.
+async fn read_post_body(
+    stream: &mut tokio::net::TcpStream,
+    initial: &[u8],
+    n: usize,
+) -> Option<String> {
     let header_end = initial[..n]
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -640,10 +784,7 @@ async fn read_post_body(stream: &mut tokio::net::TcpStream, initial: &[u8], n: u
                 .windows(2)
                 .position(|w| w == b"\n\n")
                 .map(|p| p + 2)
-        });
-    let Some(header_end) = header_end else {
-        return String::new();
-    };
+        })?;
 
     let header_str = String::from_utf8_lossy(&initial[..header_end]);
     let content_length: usize = header_str
@@ -661,7 +802,10 @@ async fn read_post_body(stream: &mut tokio::net::TcpStream, initial: &[u8], n: u
         .unwrap_or(0);
 
     if content_length == 0 {
-        return String::new();
+        return Some(String::new());
+    }
+    if content_length > MAX_BODY_SIZE {
+        return None;
     }
 
     let read_body = &initial[header_end..n];
@@ -678,7 +822,7 @@ async fn read_post_body(stream: &mut tokio::net::TcpStream, initial: &[u8], n: u
         }
     }
 
-    String::from_utf8(body).unwrap_or_default()
+    Some(String::from_utf8(body).unwrap_or_default())
 }
 
 async fn exec_cli(body: &str) -> Result<String, String> {
@@ -731,6 +875,9 @@ async fn kill_session(body: &str) -> Result<String, String> {
     if session.is_empty() || session.len() > 64 {
         return Err("Session name must be 1-64 characters".to_string());
     }
+    if !is_valid_session_name(session) {
+        return Err(session_name_error(session));
+    }
 
     let dir = get_socket_dir();
     let pid_path = dir.join(format!("{}.pid", session));
@@ -776,6 +923,9 @@ pub(super) async fn spawn_session(body: &str) -> Result<String, String> {
     if session.is_empty() || session.len() > 64 {
         return Err("Session name must be 1-64 characters".to_string());
     }
+    if !is_valid_session_name(session) {
+        return Err(session_name_error(session));
+    }
 
     let exe = std::env::current_exe().map_err(|e| format!("Cannot resolve executable: {}", e))?;
 
@@ -806,6 +956,7 @@ pub(super) async fn spawn_session(body: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::EnvGuard;
 
     #[test]
     fn test_same_origin_ws_request_matching() {
@@ -858,9 +1009,22 @@ mod tests {
     }
 
     #[test]
-    fn test_same_origin_ws_request_coder() {
+    fn test_same_origin_ws_request_coder_requires_allowlist() {
+        let guard = EnvGuard::new(&[DASHBOARD_ALLOWED_HOSTS_ENV]);
+        guard.remove(DASHBOARD_ALLOWED_HOSTS_ENV);
         let req = "GET /api/session/9222/stream HTTP/1.1\r\nHost: workspace.coder.com\r\nOrigin: https://workspace.coder.com\r\nUpgrade: websocket\r\n\r\n";
+        assert!(!is_same_origin_ws_request(req));
+
+        guard.set(DASHBOARD_ALLOWED_HOSTS_ENV, "workspace.coder.com");
         assert!(is_same_origin_ws_request(req));
+    }
+
+    #[test]
+    fn test_dns_rebinding_host_rejected_without_allowlist() {
+        let guard = EnvGuard::new(&[DASHBOARD_ALLOWED_HOSTS_ENV]);
+        guard.remove(DASHBOARD_ALLOWED_HOSTS_ENV);
+        let req = "POST /api/exec HTTP/1.1\r\nHost: evil.example:4848\r\nOrigin: http://evil.example:4848\r\n\r\n";
+        assert!(!is_same_origin_http_request(req));
     }
 
     #[test]
@@ -870,9 +1034,36 @@ mod tests {
     }
 
     #[test]
-    fn test_no_origin_header_allowed() {
+    fn test_no_origin_header_rejected_for_ws() {
         let req = "GET /api/session/9222/stream HTTP/1.1\r\nHost: localhost:4848\r\nUpgrade: websocket\r\n\r\n";
-        assert!(is_same_origin_ws_request(req));
+        assert!(!is_same_origin_ws_request(req));
+    }
+
+    #[test]
+    fn test_allowed_dashboard_host_localhost_suffix() {
+        assert!(is_allowed_dashboard_host("dashboard.agent-browser.localhost"));
+        assert!(is_allowed_dashboard_host("127.0.0.1:4848"));
+        assert!(!is_allowed_dashboard_host("evil.example"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn kill_session_rejects_path_traversal_names() {
+        let err = kill_session(r#"{"session":"../../../run/sshd"}"#)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("alphanumeric") || err.contains("Invalid") || err.contains("session"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_session_rejects_path_traversal_names() {
+        let err = spawn_session(r#"{"session":"../evil"}"#).await.unwrap_err();
+        assert!(
+            err.contains("alphanumeric") || err.contains("Invalid") || err.contains("session"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

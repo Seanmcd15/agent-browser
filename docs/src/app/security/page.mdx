@@ -131,6 +131,10 @@ Credential plugins receive `credential.resolve` and return username, password, a
 
 agent-browser keeps browser automation, redaction-sensitive output, and policy enforcement in core. Credential plugin secrets do not appear in command arguments, dashboard events, or normal command output.
 
+## Dashboard and stream HTTP
+
+The observability dashboard and per-session stream HTTP servers bind to loopback. Sensitive APIs (command relay, session spawn/kill, AI chat, session discovery, and dashboard session proxy routes) reject requests unless `Origin` or `Referer` matches an allowlisted `Host`. Allowed hosts are loopback (`localhost`, `127.0.0.1`, `::1`), RFC 6761 `*.localhost` names, and any entries in `AGENT_BROWSER_DASHBOARD_ALLOWED_HOSTS` (exact host or `*.suffix`). Session names on kill/spawn paths are restricted to alphanumeric characters, hyphens, and underscores. POST bodies are capped at 10 MB.
+
 Gate plugin access with capability actions:
 
 ```bash
