@@ -1030,21 +1030,27 @@ pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
 }
 
 /// Check if an error is transient and worth retrying against the SAME daemon.
-/// Transient errors include:
-/// - EAGAIN/EWOULDBLOCK (os error 35 on macOS, 11 on Linux)
-/// - EOF errors (daemon closed connection before responding)
-/// - Connection reset/broken pipe (daemon crashed or restarting)
+/// Transient errors include failures that happen before a response is awaited:
+/// - EAGAIN/EWOULDBLOCK while connecting or sending (os error 35 on macOS, 11 on Linux)
+/// - Connection reset/broken pipe while sending (daemon crashed or restarting)
+///
+/// Read and response errors are not retried because the daemon may still be
+/// executing the command. Re-submitting after a client-side read timeout can
+/// duplicate side effects (clicks, form submits, navigations) and queue
+/// repeated work behind the daemon state lock.
 ///
 /// Connection refused / missing socket are NOT transient: no daemon is
 /// listening, so backing off cannot help. Callers use daemon_unreachable()
 /// to respawn via ensure_daemon and retry once instead.
 fn is_transient_error(error: &str) -> bool {
+    if error.starts_with("Failed to read:") || error.starts_with("Invalid response:") {
+        return false;
+    }
+
     has_os_error(error, 35) // EAGAIN on macOS
         || has_os_error(error, 11) // EAGAIN on Linux
         || error.contains("WouldBlock")
         || error.contains("Resource temporarily unavailable")
-        || error.contains("EOF")
-        || error.contains("line 1 column 0") // Empty JSON response
         || error.contains("Connection reset")
         || error.contains("Broken pipe")
         || has_os_error(error, 54) // Connection reset by peer (macOS)
@@ -1388,16 +1394,26 @@ mod tests {
     // === Transient Error Detection Tests ===
 
     #[test]
-    fn test_is_transient_error_eagain_macos() {
-        assert!(is_transient_error(
+    fn test_read_timeout_is_not_retried_macos() {
+        assert!(!is_transient_error(
             "Failed to read: Resource temporarily unavailable (os error 35)"
         ));
     }
 
     #[test]
-    fn test_is_transient_error_eagain_linux() {
-        assert!(is_transient_error(
+    fn test_read_timeout_is_not_retried_linux() {
+        assert!(!is_transient_error(
             "Failed to read: Resource temporarily unavailable (os error 11)"
+        ));
+    }
+
+    #[test]
+    fn test_send_eagain_is_still_retried() {
+        assert!(is_transient_error(
+            "Failed to send: Resource temporarily unavailable (os error 11)"
+        ));
+        assert!(is_transient_error(
+            "Failed to send: Resource temporarily unavailable (os error 35)"
         ));
     }
 
@@ -1412,16 +1428,23 @@ mod tests {
     }
 
     #[test]
-    fn test_is_transient_error_eof() {
-        assert!(is_transient_error(
+    fn test_empty_response_is_not_retried() {
+        assert!(!is_transient_error(
             "Invalid response: EOF while parsing a value at line 1 column 0"
         ));
     }
 
     #[test]
-    fn test_is_transient_error_empty_json() {
-        assert!(is_transient_error(
+    fn test_invalid_response_is_not_retried() {
+        assert!(!is_transient_error(
             "Invalid response: expected value at line 1 column 0"
+        ));
+    }
+
+    #[test]
+    fn test_read_connection_reset_is_not_retried() {
+        assert!(!is_transient_error(
+            "Failed to read: Connection reset by peer (os error 104)"
         ));
     }
 
