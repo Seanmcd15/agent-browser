@@ -2817,6 +2817,9 @@ reaches the dashboard server, such as https://dashboard.agent-browser.localhost
 or a Coder workspace URL. The browser stays on the dashboard origin;
 session tabs, status, and stream traffic are proxied internally, so
 session ports do not need to be exposed.
+Process-control API routes accept only browser requests from the
+dashboard's own origin.
+Non-loopback proxy URLs must use HTTPS.
 
 Options:
   --port <n>           Port for the dashboard server (default: 4848)

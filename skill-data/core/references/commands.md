@@ -320,6 +320,15 @@ agent-browser state save auth.json    # Save cookies, storage, auth state
 agent-browser state load auth.json    # Restore saved state
 ```
 
+## Dashboard
+
+```bash
+agent-browser dashboard start
+agent-browser dashboard stop
+```
+
+The local dashboard proxies session traffic through its own origin. Its process-control API routes accept only browser requests from that same origin. Non-loopback proxy URLs must use HTTPS.
+
 ## MCP Server
 
 ```bash
