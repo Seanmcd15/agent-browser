@@ -3,6 +3,7 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, USER_AGENT};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::error::Error;
 use std::time::Duration;
 use url::Url;
@@ -49,6 +50,14 @@ pub struct ReadOptions {
     pub allowed_domains: Vec<String>,
     /// Additional allowlists inherited from daemon state. URLs must match every non-empty allowlist.
     pub enforced_allowed_domains: Vec<Vec<String>>,
+    /// Proxy server inherited from the resolved global CLI configuration.
+    pub proxy: Option<String>,
+    /// Hosts that should bypass the configured proxy.
+    pub proxy_bypass: Option<String>,
+    /// Username supplied separately from the proxy URL.
+    pub proxy_username: Option<String>,
+    /// Password supplied separately from the proxy URL.
+    pub proxy_password: Option<String>,
 }
 
 impl Default for ReadOptions {
@@ -63,6 +72,10 @@ impl Default for ReadOptions {
             headers: HashMap::new(),
             allowed_domains: Vec::new(),
             enforced_allowed_domains: Vec::new(),
+            proxy: None,
+            proxy_bypass: None,
+            proxy_username: None,
+            proxy_password: None,
         }
     }
 }
@@ -136,6 +149,10 @@ pub fn options_from_command(cmd: &Value) -> Result<ReadOptions, String> {
         headers,
         allowed_domains,
         enforced_allowed_domains: Vec::new(),
+        proxy: env::var("AGENT_BROWSER_PROXY").ok(),
+        proxy_bypass: env::var("AGENT_BROWSER_PROXY_BYPASS").ok(),
+        proxy_username: env::var("AGENT_BROWSER_PROXY_USERNAME").ok(),
+        proxy_password: env::var("AGENT_BROWSER_PROXY_PASSWORD").ok(),
     })
 }
 
@@ -171,6 +188,15 @@ pub fn normalize_url(raw: &str) -> Result<Url, String> {
     Ok(url)
 }
 
+fn reqwest_no_proxy_list(raw: &str) -> String {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| entry.strip_prefix("*.").unwrap_or(entry))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 struct ReadFetch {
     final_url: String,
     status: u16,
@@ -200,9 +226,22 @@ pub async fn run_read(raw_url: &str, options: ReadOptions) -> Result<Value, Stri
             attempt.follow()
         }
     });
-    let client = Client::builder()
+    let mut client_builder = Client::builder()
         .timeout(Duration::from_millis(options.timeout_ms))
-        .redirect(redirect_policy)
+        .redirect(redirect_policy);
+    if let Some(server) = options.proxy.as_deref() {
+        let mut proxy = reqwest::Proxy::all(server)
+            .map_err(|e| format!("Invalid proxy configuration: {}", e))?;
+        if let Some(username) = options.proxy_username.as_deref() {
+            proxy = proxy.basic_auth(username, options.proxy_password.as_deref().unwrap_or(""));
+        }
+        if let Some(bypass) = options.proxy_bypass.as_deref() {
+            let bypass = reqwest_no_proxy_list(bypass);
+            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(&bypass));
+        }
+        client_builder = client_builder.proxy(proxy);
+    }
+    let client = client_builder
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
@@ -1237,6 +1276,14 @@ mod tests {
     }
 
     #[test]
+    fn reqwest_no_proxy_list_normalizes_documented_wildcards() {
+        assert_eq!(
+            reqwest_no_proxy_list("localhost,*.internal.com, 10.0.0.0/8"),
+            "localhost,internal.com,10.0.0.0/8"
+        );
+    }
+
+    #[test]
     fn llms_file_candidates_walks_to_origin_root() {
         let url = normalize_url("https://example.com/docs/organize/navigation?x=1").unwrap();
         let candidates = llms_file_candidates(&url, "llms.txt")
@@ -1554,6 +1601,38 @@ Inline [Authentication](/inline-auth) should not become a TOC item.
         let data = run_read(&base, ReadOptions::default()).await.unwrap();
         assert_eq!(data["source"], "accept-markdown");
         assert_eq!(data["content"], "# Markdown\n");
+    }
+
+    #[tokio::test]
+    async fn run_read_routes_requests_through_configured_proxy() {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = proxy_listener.accept().await.unwrap();
+            let mut buf = [0_u8; 2048];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            assert!(request.starts_with("get http://example.invalid/docs "));
+            let body = "# Proxied\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/markdown\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let options = ReadOptions {
+            proxy: Some(format!("http://{}", proxy_addr)),
+            ..ReadOptions::default()
+        };
+        let data = run_read("http://example.invalid/docs", options)
+            .await
+            .unwrap();
+
+        assert_eq!(data["source"], "accept-markdown");
+        assert_eq!(data["content"], "# Proxied\n");
     }
 
     #[tokio::test]
