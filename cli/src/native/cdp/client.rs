@@ -295,7 +295,10 @@ impl CdpClient {
     }
 
     /// Send raw JSON through the WebSocket without tracking a response.
+    ///
     /// Used by the inspect proxy to forward DevTools frontend messages.
+    /// Callers must use negative message IDs so responses cannot collide with
+    /// this client's positive `pending` map keys (`CdpMessage.id` is `u64`).
     pub async fn send_raw(&self, json: String) -> Result<(), String> {
         let mut ws_tx = self.ws_tx.lock().await;
         ws_tx
