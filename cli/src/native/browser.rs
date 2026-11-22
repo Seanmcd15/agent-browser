@@ -649,6 +649,15 @@ impl BrowserManager {
             .ok_or_else(|| "No active page".to_string())
     }
 
+    /// CDP session IDs for all attached page targets (not iframes / temp targets).
+    pub fn page_session_ids(&self) -> Vec<String> {
+        self.pages
+            .iter()
+            .map(|p| p.session_id.clone())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
     pub async fn navigate(&mut self, url: &str, wait_until: WaitUntil) -> Result<Value, String> {
         let session_id = self.active_session_id()?.to_string();
         let mut lifecycle_rx = self.client.subscribe();

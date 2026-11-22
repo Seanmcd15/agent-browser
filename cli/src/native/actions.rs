@@ -5,7 +5,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::{broadcast, oneshot, RwLock};
 
@@ -301,6 +301,14 @@ pub struct DaemonState {
     /// Proxy authentication credentials (username, password) for handling
     /// Fetch.authRequired events from authenticated proxies.
     pub proxy_credentials: Arc<RwLock<Option<(String, String)>>>,
+    /// CDP session IDs whose Fetch traffic is owned by temporary storage
+    /// collection (multi-origin save). The background fetch handler must not
+    /// continue/fail/fulfill those requests or it races the blank-HTML
+    /// interceptor and can skip origins, dropping localStorage on auto-save.
+    pub fetch_ignore_sessions: Arc<Mutex<HashSet<String>>>,
+    /// Page and iframe CDP session IDs the background fetch handler is allowed
+    /// to service. Temp storage-collection sessions are excluded by omission.
+    pub fetch_known_sessions: Arc<Mutex<HashSet<String>>>,
     /// Background task that processes Fetch.requestPaused events in real-time,
     /// handling domain filtering, route interception, and origin-scoped headers
     /// without deadlocking navigation/evaluate.
@@ -386,6 +394,8 @@ impl DaemonState {
             iframe_sessions: HashMap::new(),
             origin_headers: Arc::new(RwLock::new(HashMap::new())),
             proxy_credentials: Arc::new(RwLock::new(None)),
+            fetch_ignore_sessions: Arc::new(Mutex::new(HashSet::new())),
+            fetch_known_sessions: Arc::new(Mutex::new(HashSet::new())),
             fetch_handler_task: None,
             dialog_handler_task: None,
             mouse_state: MouseState::default(),
@@ -448,6 +458,26 @@ impl DaemonState {
         }
     }
 
+    /// Refresh the allowlist of CDP sessions the background Fetch handler may
+    /// service (attached pages + known iframe sessions).
+    fn refresh_fetch_known_sessions(&self) {
+        let mut known = match self.fetch_known_sessions.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        known.clear();
+        if let Some(ref browser) = self.browser {
+            for sid in browser.page_session_ids() {
+                known.insert(sid);
+            }
+        }
+        for sid in self.iframe_sessions.values() {
+            if !sid.is_empty() {
+                known.insert(sid.clone());
+            }
+        }
+    }
+
     /// Start the background task that processes Fetch.requestPaused and
     /// Fetch.authRequired events in real-time (domain filtering, route
     /// interception, origin-scoped headers, proxy authentication).
@@ -462,12 +492,16 @@ impl DaemonState {
             return;
         };
 
+        self.refresh_fetch_known_sessions();
+
         let client = browser.client.clone();
         let mut rx = browser.client.subscribe();
         let domain_filter = self.domain_filter.clone();
         let routes = self.routes.clone();
         let origin_headers = self.origin_headers.clone();
         let proxy_credentials = self.proxy_credentials.clone();
+        let fetch_ignore_sessions = self.fetch_ignore_sessions.clone();
+        let fetch_known_sessions = self.fetch_known_sessions.clone();
 
         self.fetch_handler_task = Some(tokio::spawn(async move {
             loop {
@@ -480,6 +514,13 @@ impl DaemonState {
                             .unwrap_or("")
                             .to_string();
                         let sid = event.session_id.clone().unwrap_or_default();
+                        if !fetch_session_should_handle(
+                            &fetch_ignore_sessions,
+                            &fetch_known_sessions,
+                            &sid,
+                        ) {
+                            continue;
+                        }
                         let creds = proxy_credentials.read().await;
                         if let Some((ref user, ref pass)) = *creds {
                             let _ = client
@@ -538,6 +579,13 @@ impl DaemonState {
                             .and_then(|h| h.as_object())
                             .cloned();
                         let sid = event.session_id.clone().unwrap_or_default();
+                        if !fetch_session_should_handle(
+                            &fetch_ignore_sessions,
+                            &fetch_known_sessions,
+                            &sid,
+                        ) {
+                            continue;
+                        }
 
                         let paused = FetchPausedRequest {
                             request_id,
@@ -782,6 +830,14 @@ impl DaemonState {
             if let Some(ref mut mgr) = self.browser {
                 mgr.update_page_target_info(&te.target_info);
             }
+        }
+
+        if !drained.destroyed_targets.is_empty()
+            || !drained.new_targets.is_empty()
+            || !drained.attached_iframe_sessions.is_empty()
+            || !drained.detached_iframe_sessions.is_empty()
+        {
+            self.refresh_fetch_known_sessions();
         }
     }
 
@@ -2554,6 +2610,7 @@ pub(crate) async fn auto_save_restore_state(
         &session_name,
         &state.session_id,
         mgr.visited_origins(),
+        Some(&state.fetch_ignore_sessions),
     )
     .await
     {
@@ -4486,6 +4543,7 @@ async fn handle_state_save(cmd: &Value, state: &DaemonState) -> Result<Value, St
         state.session_name.as_deref(),
         &state.session_id,
         mgr.visited_origins(),
+        Some(&state.fetch_ignore_sessions),
     )
     .await?;
 
@@ -4766,7 +4824,9 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     state.ref_map.clear();
     state.iframe_sessions.clear();
     state.active_frame_id = None;
-    mgr.tab_new(url, label).await
+    let result = mgr.tab_new(url, label).await?;
+    state.refresh_fetch_known_sessions();
+    Ok(result)
 }
 
 async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -4815,7 +4875,9 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     state.ref_map.clear();
     state.iframe_sessions.clear();
     state.active_frame_id = None;
-    mgr.tab_close_by_id(tab_id).await
+    let result = mgr.tab_close_by_id(tab_id).await?;
+    state.refresh_fetch_known_sessions();
+    Ok(result)
 }
 
 async fn handle_viewport(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -8034,6 +8096,42 @@ fn route_url_matches(pattern: &str, url: &str) -> bool {
     }
 
     true
+}
+
+/// True when a CDP session's Fetch traffic is owned by multi-origin storage
+/// collection and must not be handled by the background domain-filter/route
+/// interceptor.
+pub(crate) fn fetch_session_is_ignored(ignore: &Mutex<HashSet<String>>, session_id: &str) -> bool {
+    ignore
+        .lock()
+        .map(|guard| guard.contains(session_id))
+        .unwrap_or(false)
+}
+
+fn fetch_session_is_known(known: &Mutex<HashSet<String>>, session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    known
+        .lock()
+        .map(|guard| guard.contains(session_id))
+        .unwrap_or(false)
+}
+
+/// Background Fetch handler admission control: never service storage-collection
+/// sessions, and only service sessions that belong to attached pages/iframes.
+pub(crate) fn fetch_session_should_handle(
+    ignore: &Mutex<HashSet<String>>,
+    known: &Mutex<HashSet<String>>,
+    session_id: &str,
+) -> bool {
+    if fetch_session_is_ignored(ignore, session_id) {
+        return false;
+    }
+    // Empty session IDs are not page-scoped flattened sessions; refusing them
+    // prevents abort/domain-filter routes from claiming temp-target requests
+    // when Chrome omits sessionId on Fetch.requestPaused.
+    fetch_session_is_known(known, session_id)
 }
 
 async fn resolve_fetch_paused(
@@ -11302,5 +11400,61 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             let auto_handled = auto_dialog && matches!(*dialog_type, "beforeunload" | "alert");
             assert!(!auto_handled, "{dialog_type} should NOT be auto-handled");
         }
+    }
+
+    #[test]
+    fn test_fetch_handler_ignores_storage_collection_sessions() {
+        let state = DaemonState::new();
+        {
+            let mut known = state.fetch_known_sessions.lock().unwrap();
+            known.insert("page-session".to_string());
+        }
+
+        assert!(
+            fetch_session_should_handle(
+                &state.fetch_ignore_sessions,
+                &state.fetch_known_sessions,
+                "page-session"
+            ),
+            "known page sessions must still be handled"
+        );
+
+        {
+            let mut ignore = state.fetch_ignore_sessions.lock().unwrap();
+            ignore.insert("storage-temp-session".to_string());
+        }
+
+        assert!(
+            !fetch_session_should_handle(
+                &state.fetch_ignore_sessions,
+                &state.fetch_known_sessions,
+                "storage-temp-session"
+            ),
+            "temp multi-origin storage sessions must be ignored by the fetch handler"
+        );
+        assert!(
+            !fetch_session_should_handle(
+                &state.fetch_ignore_sessions,
+                &state.fetch_known_sessions,
+                "unknown-session"
+            ),
+            "sessions outside the page/iframe allowlist must not be handled"
+        );
+        assert!(
+            !fetch_session_should_handle(
+                &state.fetch_ignore_sessions,
+                &state.fetch_known_sessions,
+                ""
+            ),
+            "empty session IDs must not be handled (avoids claiming temp-target Fetch events)"
+        );
+        assert!(
+            fetch_session_should_handle(
+                &state.fetch_ignore_sessions,
+                &state.fetch_known_sessions,
+                "page-session"
+            ),
+            "ignoring a storage session must not affect known page sessions"
+        );
     }
 }

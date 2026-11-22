@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -107,6 +108,23 @@ async fn eval_origin_storage(
     parse_origin_storage(&data)
 }
 
+/// Shared set of CDP session IDs whose Fetch traffic is owned by temporary
+/// multi-origin storage collection. The daemon's background fetch handler
+/// must skip these sessions so it does not race blank-HTML fulfillment.
+pub type FetchIgnoreSessions = Arc<Mutex<HashSet<String>>>;
+
+fn register_fetch_ignore_session(ignore: &FetchIgnoreSessions, session_id: &str) {
+    if let Ok(mut guard) = ignore.lock() {
+        guard.insert(session_id.to_string());
+    }
+}
+
+fn unregister_fetch_ignore_session(ignore: &FetchIgnoreSessions, session_id: &str) {
+    if let Ok(mut guard) = ignore.lock() {
+        guard.remove(session_id);
+    }
+}
+
 /// Create a temporary CDP target, navigate it to each origin to collect localStorage,
 /// then close it. Uses Fetch interception to serve blank HTML instead of making real
 /// network requests.
@@ -114,6 +132,7 @@ async fn collect_storage_via_temp_target(
     client: &CdpClient,
     origins: &[String],
     origin_js: &str,
+    fetch_ignore_sessions: Option<&FetchIgnoreSessions>,
 ) -> Result<Vec<OriginStorage>, String> {
     let create_result: CreateTargetResult = client
         .send_command_typed(
@@ -128,7 +147,14 @@ async fn collect_storage_via_temp_target(
     let target_id = create_result.target_id;
 
     // Ensure the target is closed even if attach or later steps fail
-    let result = collect_storage_in_target(client, &target_id, origins, origin_js).await;
+    let result = collect_storage_in_target(
+        client,
+        &target_id,
+        origins,
+        origin_js,
+        fetch_ignore_sessions,
+    )
+    .await;
 
     let _ = client
         .send_command_typed::<_, Value>(
@@ -146,6 +172,7 @@ async fn collect_storage_in_target(
     target_id: &str,
     origins: &[String],
     origin_js: &str,
+    fetch_ignore_sessions: Option<&FetchIgnoreSessions>,
 ) -> Result<Vec<OriginStorage>, String> {
     let attach_result: AttachToTargetResult = client
         .send_command_typed(
@@ -160,89 +187,128 @@ async fn collect_storage_in_target(
 
     let temp_session = &attach_result.session_id;
 
-    client
-        .send_command_no_params("Page.enable", Some(temp_session))
-        .await?;
-    client
-        .send_command_no_params("Runtime.enable", Some(temp_session))
-        .await?;
+    // Exclude this session from the daemon Fetch handler BEFORE enabling
+    // interception. Otherwise domain-filter / route continueRequest wins the
+    // race against blank-HTML fulfillRequest and multi-origin saves can skip
+    // origins (silent localStorage loss on auto-save / close).
+    if let Some(ignore) = fetch_ignore_sessions {
+        register_fetch_ignore_session(ignore, temp_session);
+    }
 
-    // Blank HTML response body, pre-encoded to avoid repeated base64 work per request
-    let blank_html_b64 = base64::engine::general_purpose::STANDARD.encode("<html></html>");
+    let collection = async {
+        client
+            .send_command_no_params("Page.enable", Some(temp_session))
+            .await?;
+        client
+            .send_command_no_params("Runtime.enable", Some(temp_session))
+            .await?;
+        // Chrome 144+ may leave newly attached targets paused until resumed.
+        // Without this, Page.navigate never reaches Fetch.requestPaused / load,
+        // and multi-origin localStorage collection silently skips origins.
+        let _ = client
+            .send_command_no_params("Runtime.runIfWaitingForDebugger", Some(temp_session))
+            .await;
 
-    let _ = client
-        .send_command(
-            "Fetch.enable",
-            Some(json!({ "patterns": [{ "urlPattern": "*" }] })),
-            Some(temp_session),
-        )
-        .await;
+        // Blank HTML response body, pre-encoded to avoid repeated base64 work per request
+        let blank_html_b64 = base64::engine::general_purpose::STANDARD.encode("<html></html>");
 
-    let mut event_rx = client.subscribe();
-    let mut results = Vec::new();
-
-    for target_origin in origins {
-        let nav_url = format!("{}/", target_origin.trim_end_matches('/'));
-        if client
+        let _ = client
             .send_command(
+                "Fetch.enable",
+                Some(json!({ "patterns": [{ "urlPattern": "*" }] })),
+                Some(temp_session),
+            )
+            .await;
+
+        let mut event_rx = client.subscribe();
+        let mut results = Vec::new();
+
+        for target_origin in origins {
+            let nav_url = format!("{}/", target_origin.trim_end_matches('/'));
+
+            // Page.navigate does not resolve while Fetch is paused for the
+            // document request. Awaiting navigate before fulfilling
+            // requestPaused therefore deadlocks (30s CDP timeout) unless some
+            // other task continues the request. Drive navigate and Fetch
+            // fulfillment concurrently so blank-HTML interception works even
+            // when the daemon fetch handler ignores this temp session.
+            let nav_fut = client.send_command(
                 "Page.navigate",
                 Some(json!({ "url": nav_url })),
                 Some(temp_session),
-            )
-            .await
-            .is_err()
-        {
-            continue;
-        }
+            );
+            tokio::pin!(nav_fut);
 
-        // Fulfill intercepted requests with blank HTML until the page loads
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        let mut page_loaded = false;
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(tokio::time::Duration::from_secs(2), event_rx.recv()).await {
-                Ok(Ok(evt)) if evt.session_id.as_deref() == Some(temp_session) => {
-                    if evt.method == "Fetch.requestPaused" {
-                        if let Some(request_id) =
-                            evt.params.get("requestId").and_then(|v| v.as_str())
-                        {
-                            let _ = client
-                                .send_command(
-                                    "Fetch.fulfillRequest",
-                                    Some(json!({
-                                        "requestId": request_id,
-                                        "responseCode": 200,
-                                        "responseHeaders": [
-                                            { "name": "Content-Type", "value": "text/html" }
-                                        ],
-                                        "body": &blank_html_b64
-                                    })),
-                                    Some(temp_session),
-                                )
-                                .await;
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+            let mut page_loaded = false;
+            let mut nav_finished = false;
+            let mut nav_failed = false;
+
+            while tokio::time::Instant::now() < deadline && !page_loaded {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                tokio::select! {
+                    nav_res = &mut nav_fut, if !nav_finished => {
+                        nav_finished = true;
+                        if nav_res.is_err() {
+                            nav_failed = true;
                         }
-                    } else if evt.method == "Page.loadEventFired" {
-                        page_loaded = true;
+                    }
+                    evt = event_rx.recv() => {
+                        match evt {
+                            Ok(evt) if evt.session_id.as_deref() == Some(temp_session) => {
+                                if evt.method == "Fetch.requestPaused" {
+                                    if let Some(request_id) =
+                                        evt.params.get("requestId").and_then(|v| v.as_str())
+                                    {
+                                        let _ = client
+                                            .send_command(
+                                                "Fetch.fulfillRequest",
+                                                Some(json!({
+                                                    "requestId": request_id,
+                                                    "responseCode": 200,
+                                                    "responseHeaders": [
+                                                        { "name": "Content-Type", "value": "text/html" }
+                                                    ],
+                                                    "body": &blank_html_b64
+                                                })),
+                                                Some(temp_session),
+                                            )
+                                            .await;
+                                    }
+                                } else if evt.method == "Page.loadEventFired" {
+                                    page_loaded = true;
+                                }
+                            }
+                            Ok(_) => {}  // event for a different session
+                            Err(_) => {} // lagged or closed — keep waiting within deadline
+                        }
+                    }
+                    _ = tokio::time::sleep(remaining) => {
                         break;
                     }
                 }
-                Ok(Ok(_)) => continue,  // event for a different session
-                Ok(Err(_)) => continue, // lagged or closed — retry within deadline
-                Err(_) => break,        // outer timeout elapsed
+            }
+
+            if nav_failed || !page_loaded {
+                continue;
+            }
+
+            if let Some(storage) = eval_origin_storage(client, temp_session, origin_js).await {
+                if !storage.local_storage.is_empty() || !storage.session_storage.is_empty() {
+                    results.push(storage);
+                }
             }
         }
 
-        if !page_loaded {
-            continue;
-        }
+        Ok(results)
+    }
+    .await;
 
-        if let Some(storage) = eval_origin_storage(client, temp_session, origin_js).await {
-            if !storage.local_storage.is_empty() || !storage.session_storage.is_empty() {
-                results.push(storage);
-            }
-        }
+    if let Some(ignore) = fetch_ignore_sessions {
+        unregister_fetch_ignore_session(ignore, temp_session);
     }
 
-    Ok(results)
+    collection
 }
 
 pub async fn save_state(
@@ -252,6 +318,7 @@ pub async fn save_state(
     session_name: Option<&str>,
     session_id_str: &str,
     visited_origins: &HashSet<String>,
+    fetch_ignore_sessions: Option<&FetchIgnoreSessions>,
 ) -> Result<String, String> {
     let cookies = cookies::get_all_cookies(client, session_id).await?;
 
@@ -298,10 +365,11 @@ pub async fn save_state(
     all_origins.remove(&current_origin);
     if !all_origins.is_empty() {
         let remaining: Vec<String> = all_origins.into_iter().collect();
-        if let Ok(temp_origins) =
-            collect_storage_via_temp_target(client, &remaining, origin_js).await
+        match collect_storage_via_temp_target(client, &remaining, origin_js, fetch_ignore_sessions)
+            .await
         {
-            origins.extend(temp_origins);
+            Ok(temp_origins) => origins.extend(temp_origins),
+            Err(_) => {}
         }
     }
 
@@ -343,6 +411,7 @@ pub async fn save_auto_state_transactional(
     session_name: &str,
     session_id_str: &str,
     visited_origins: &HashSet<String>,
+    fetch_ignore_sessions: Option<&FetchIgnoreSessions>,
 ) -> Result<String, String> {
     if !is_valid_session_name(session_name) {
         return Err(session_name_error(session_name));
@@ -382,6 +451,7 @@ pub async fn save_auto_state_transactional(
         Some(session_name),
         session_id_str,
         visited_origins,
+        fetch_ignore_sessions,
     )
     .await?;
 
@@ -1057,5 +1127,14 @@ mod tests {
         let result = dispatch_state_command(&cmd).unwrap();
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Missing 'name' parameter");
+    }
+
+    #[test]
+    fn test_fetch_ignore_session_register_and_unregister() {
+        let ignore: FetchIgnoreSessions = Arc::new(Mutex::new(HashSet::new()));
+        register_fetch_ignore_session(&ignore, "temp-1");
+        assert!(ignore.lock().unwrap().contains("temp-1"));
+        unregister_fetch_ignore_session(&ignore, "temp-1");
+        assert!(!ignore.lock().unwrap().contains("temp-1"));
     }
 }
