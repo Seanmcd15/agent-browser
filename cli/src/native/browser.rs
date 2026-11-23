@@ -1470,20 +1470,85 @@ impl BrowserManager {
     }
 
     pub async fn set_download_behavior(&self, download_path: &str) -> Result<(), String> {
-        let session_id = self.active_session_id()?;
-        self.client
+        // Browser.setDownloadBehavior is browser-scoped. Passing only a page
+        // sessionId updates the *default* context; non-default contexts created
+        // by `window new` / recording never receive the policy and downloads are
+        // silently dropped. Always resolve and pass browserContextId instead.
+        let target_id = self
+            .pages
+            .get(self.active_page_index)
+            .map(|p| p.target_id.clone())
+            .ok_or_else(|| "No active page".to_string())?;
+        let info = self
+            .client
             .send_command(
-                "Browser.setDownloadBehavior",
-                Some(json!({
-                    "behavior": "allowAndName",
-                    "downloadPath": download_path,
-                    "eventsEnabled": true,
-                })),
-                Some(session_id),
+                "Target.getTargetInfo",
+                Some(json!({ "targetId": target_id })),
+                None,
             )
+            .await?;
+        let browser_context_id = info
+            .get("targetInfo")
+            .and_then(|t| t.get("browserContextId"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        let params = download_behavior_params(download_path, browser_context_id.as_deref());
+        self.client
+            .send_command("Browser.setDownloadBehavior", Some(params), None)
             .await?;
         Ok(())
     }
+
+    /// Re-apply launch download / HTTPS settings to an explicit browser context
+    /// (used when `window new` or recording creates a non-default context).
+    pub async fn apply_context_launch_settings(
+        &self,
+        browser_context_id: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        if let Some(ref dl_path) = self.download_path {
+            let params = download_behavior_params(dl_path, Some(browser_context_id));
+            let _ = self
+                .client
+                .send_command("Browser.setDownloadBehavior", Some(params), None)
+                .await;
+        }
+        if self.ignore_https_errors {
+            let _ = self
+                .client
+                .send_command(
+                    "Security.setIgnoreCertificateErrors",
+                    Some(json!({ "ignore": true })),
+                    Some(session_id),
+                )
+                .await;
+        }
+        Ok(())
+    }
+}
+
+/// Build Browser.setDownloadBehavior params. When `browser_context_id` is set,
+/// downloads are allowed in that context; omitting it targets the default
+/// context only.
+pub(crate) fn download_behavior_params(
+    download_path: &str,
+    browser_context_id: Option<&str>,
+) -> Value {
+    let mut params = json!({
+        "behavior": "allowAndName",
+        "downloadPath": download_path,
+        "eventsEnabled": true,
+    });
+    if let Some(ctx) = browser_context_id {
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert(
+                "browserContextId".to_string(),
+                Value::String(ctx.to_string()),
+            );
+        }
+    }
+    params
 }
 
 /// Core network-idle polling loop, extracted so it can be unit-tested without a
@@ -2198,5 +2263,22 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("Timeout waiting for networkidle"));
+    }
+
+    #[test]
+    fn test_download_behavior_params_include_browser_context_id() {
+        let params = download_behavior_params("/tmp/dl", Some("CTX-123"));
+        assert_eq!(params["behavior"], "allowAndName");
+        assert_eq!(params["downloadPath"], "/tmp/dl");
+        assert_eq!(params["eventsEnabled"], true);
+        assert_eq!(params["browserContextId"], "CTX-123");
+    }
+
+    #[test]
+    fn test_download_behavior_params_omit_context_for_default() {
+        let params = download_behavior_params("/tmp/dl", None);
+        assert_eq!(params["behavior"], "allowAndName");
+        assert_eq!(params["downloadPath"], "/tmp/dl");
+        assert!(params.get("browserContextId").is_none());
     }
 }

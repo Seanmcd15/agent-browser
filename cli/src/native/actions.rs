@@ -4879,6 +4879,25 @@ async fn handle_set_media(cmd: &Value, state: &DaemonState) -> Result<Value, Str
     Ok(json!({ "set": true }))
 }
 
+/// Bind / match a download GUID from CDP progress events.
+///
+/// Returns true when `event_guid` belongs to the download we are waiting for.
+/// The first observed GUID (from WillBegin or Progress) becomes the lock; later
+/// events for other GUIDs are ignored so concurrent downloads cannot complete
+/// this wait early.
+fn download_event_guid_matches(locked_guid: &mut Option<String>, event_guid: Option<&str>) -> bool {
+    if locked_guid.is_none() {
+        if let Some(guid) = event_guid {
+            *locked_guid = Some(guid.to_string());
+        }
+    }
+    match (&*locked_guid, event_guid) {
+        (Some(expected), Some(got)) => expected == got,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let selector = cmd
         .get("selector")
@@ -4964,7 +4983,8 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
                     method == browser_method || (method == page_method && is_page_session)
                 };
 
-                // Capture the GUID from downloadWillBegin
+                // Capture the GUID from downloadWillBegin (or the first progress
+                // event if WillBegin was missed / reordered).
                 if is_download_event(
                     &event.method,
                     "Browser.downloadWillBegin",
@@ -4974,18 +4994,24 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
                         downloaded_guid = Some(guid.to_string());
                     }
                 }
-                // Check for download completion or cancellation
+                // Check for download completion or cancellation. Match GUID so a
+                // concurrent/unrelated Browser.downloadProgress cannot complete
+                // this wait early and leave us renaming the wrong file (or
+                // succeeding against a stale destination path).
                 if is_download_event(
                     &event.method,
                     "Browser.downloadProgress",
                     "Page.downloadProgress",
                 ) {
-                    match event.params.get("state").and_then(|v| v.as_str()) {
-                        Some("completed") => break,
-                        Some("canceled") => {
-                            return Err("Download was canceled".to_string());
+                    let event_guid = event.params.get("guid").and_then(|v| v.as_str());
+                    if download_event_guid_matches(&mut downloaded_guid, event_guid) {
+                        match event.params.get("state").and_then(|v| v.as_str()) {
+                            Some("completed") => break,
+                            Some("canceled") => {
+                                return Err("Download was canceled".to_string());
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -5001,7 +5027,7 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         let guid_path = download_dir.join(&guid);
         // Chrome may still be flushing the file to disk after signalling
         // completion; wait briefly for it to appear.
-        for _ in 0..10 {
+        for _ in 0..20 {
             if guid_path.exists() {
                 break;
             }
@@ -5011,14 +5037,13 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
             std::fs::rename(&guid_path, &dest)
                 .map_err(|e| format!("Failed to rename downloaded file: {}", e))?;
         } else {
-            // The file might have been saved under its original name instead
-            // of the GUID (e.g. when Chrome falls back to "allow" behavior).
-            if !dest.exists() {
-                return Err(format!(
-                    "Downloaded file not found at expected path (GUID: {})",
-                    guid
-                ));
-            }
+            // Do not treat a pre-existing destination as success: that silently
+            // returns stale content from a prior download when the GUID file
+            // never appeared (context misconfiguration, flush delay, cancel).
+            return Err(format!(
+                "Downloaded file not found at expected path (GUID: {})",
+                guid
+            ));
         }
     } else {
         // GUID capture failed -- the file may have been saved under its original name
@@ -5145,37 +5170,11 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
         let new_session_id = attach_result.session_id.clone();
         mgr.enable_domains_pub(&new_session_id).await?;
 
-        // Re-apply download behavior to the recording context.
+        // Re-apply download / HTTPS settings to the recording context.
         // Without this, downloads in the recording context are silently dropped
         // because Browser.setDownloadBehavior at launch only applies to the default context.
-        if let Some(ref dl_path) = mgr.download_path {
-            let _ = mgr
-                .client
-                .send_command(
-                    "Browser.setDownloadBehavior",
-                    Some(json!({
-                        "behavior": "allow",
-                        "downloadPath": dl_path,
-                        "browserContextId": context_id,
-                        "eventsEnabled": true
-                    })),
-                    None,
-                )
-                .await;
-        }
-
-        // Re-apply HTTPS error ignore to the recording context.
-        // Security.setIgnoreCertificateErrors at launch only applies to the session it was sent on.
-        if mgr.ignore_https_errors {
-            let _ = mgr
-                .client
-                .send_command(
-                    "Security.setIgnoreCertificateErrors",
-                    Some(json!({ "ignore": true })),
-                    Some(&new_session_id),
-                )
-                .await;
-        }
+        mgr.apply_context_launch_settings(&context_id, &new_session_id)
+            .await?;
 
         // Transfer cookies to new context
         if let Some(ref cr) = cookies_result {
@@ -7465,15 +7464,23 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
         .await?;
 
     let tab_id = mgr.assign_tab_id();
+    let new_session_id = attach.session_id.clone();
+    mgr.enable_domains_pub(&new_session_id).await?;
     mgr.add_page(super::browser::PageInfo {
         tab_id,
         label: None,
         target_id: create_result.target_id,
-        session_id: attach.session_id,
+        session_id: new_session_id.clone(),
         url: "about:blank".to_string(),
         title: String::new(),
         target_type: "page".to_string(),
     });
+
+    // Browser.setDownloadBehavior / Security.setIgnoreCertificateErrors at
+    // launch only cover the default context. Re-apply them so downloads and
+    // HTTPS settings work in the new window's isolated context.
+    mgr.apply_context_launch_settings(&context_id, &new_session_id)
+        .await?;
 
     if let Some(viewport) = cmd.get("viewport") {
         let width = viewport
@@ -11302,5 +11309,25 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             let auto_handled = auto_dialog && matches!(*dialog_type, "beforeunload" | "alert");
             assert!(!auto_handled, "{dialog_type} should NOT be auto-handled");
         }
+    }
+
+    #[test]
+    fn test_download_event_guid_matches_locks_first_guid() {
+        let mut locked = None;
+        assert!(download_event_guid_matches(&mut locked, Some("g1")));
+        assert_eq!(locked.as_deref(), Some("g1"));
+        // Concurrent download with a different GUID must not match.
+        assert!(!download_event_guid_matches(&mut locked, Some("g2")));
+        // Matching GUID still matches.
+        assert!(download_event_guid_matches(&mut locked, Some("g1")));
+        // Progress without guid after lock still matches (rare CDP omission).
+        assert!(download_event_guid_matches(&mut locked, None));
+    }
+
+    #[test]
+    fn test_download_event_guid_ignores_progress_before_guid() {
+        let mut locked = None;
+        assert!(!download_event_guid_matches(&mut locked, None));
+        assert!(locked.is_none());
     }
 }
