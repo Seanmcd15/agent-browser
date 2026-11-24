@@ -163,14 +163,16 @@ pub async fn fill(
         )
         .await?;
 
-    // Insert text (keyboard input dispatched at page level, use parent session_id)
+    // Insert text into the focused element. For OOPIF refs, Input.* must use the
+    // iframe CDP session (effective_session_id); the parent session accepts the
+    // command but never types into the cross-origin focused input.
     client
         .send_command_typed::<_, Value>(
             "Input.insertText",
             &InsertTextParams {
                 text: value.to_string(),
             },
-            Some(session_id),
+            Some(&effective_session_id),
         )
         .await?;
 
@@ -233,7 +235,7 @@ pub async fn type_text(
             .await?;
     }
 
-    type_text_into_active_context(client, session_id, text, delay_ms).await
+    type_text_into_active_context(client, &effective_session_id, text, delay_ms).await
 }
 
 pub async fn type_text_into_active_context(
